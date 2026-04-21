@@ -1061,8 +1061,18 @@ def launch_core_engines(
     if parallel_config.enable_elastic_ep:
         handshake_local_only = False
 
+    handshake_connect_host = host
+    if local_engines_only and dp_rank > 0 and not offline_mode:
+        # In multi-node external/hybrid DP LB, the first engine handshake for
+        # rank>0 must connect to the rank 0 front-end. `data_parallel_master_ip`
+        # is this node's local bind address, while `master_addr` identifies the
+        # head node to contact.
+        handshake_connect_host = parallel_config.master_addr or host
+
     handshake_address = get_engine_client_zmq_addr(
-        handshake_local_only, host, parallel_config.data_parallel_rpc_port
+        handshake_local_only,
+        handshake_connect_host,
+        parallel_config.data_parallel_rpc_port,
     )
 
     if local_engines_only and dp_rank > 0:
