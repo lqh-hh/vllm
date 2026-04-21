@@ -973,6 +973,30 @@ def launch_core_engines(
         vllm_config.needs_dp_coordinator and not offline_mode and dp_rank == 0
     )
 
+    coord_store = None
+
+    if (
+        parallel_config.enable_elastic_ep
+        and parallel_config.data_parallel_backend != "ray"
+        and dp_rank == 0
+        and not parallel_config._coord_store_port
+    ):
+        from vllm.distributed.utils import create_tcp_store
+
+        coord_store = create_tcp_store(
+            host,
+            0,
+            is_master=True,
+            world_size=-1,
+            wait_for_workers=False,
+        )
+        parallel_config._coord_store_port = coord_store.port
+        logger.info(
+            "Created Elastic EP coordination TCPStore on %s:%d",
+            host,
+            coord_store.port,
+        )
+
     if run_coordinator:
         coordinator = DPCoordinator(
             parallel_config,
@@ -987,6 +1011,8 @@ def launch_core_engines(
         )
 
         logger.info("Started DP Coordinator process (PID: %d)", coordinator.proc.pid)
+        if coord_store is not None:
+            coordinator._coord_store = coord_store
     else:
         coordinator = None
 
@@ -1067,6 +1093,11 @@ def launch_core_engines(
         else:
             local_engine_manager = None
 
+        if coord_store is not None and coordinator is None and (
+            local_engine_manager is not None
+        ):
+            local_engine_manager._coord_store = coord_store
+
         yield local_engine_manager, coordinator, addresses, tensor_queue
 
         # Now wait for engines to start.
@@ -1076,6 +1107,7 @@ def launch_core_engines(
             engines_to_handshake,
             parallel_config,
             dp_size > 1 and vllm_config.model_config.is_moe,
+            not (local_engines_only and dp_rank > 0),
             vllm_config.cache_config,
             local_engine_manager,
             coordinator.proc if coordinator else None,
@@ -1088,6 +1120,7 @@ def wait_for_engine_startup(
     core_engines: list[CoreEngine],
     parallel_config: ParallelConfig,
     coordinated_dp: bool,
+    send_parallel_config: bool,
     cache_config: CacheConfig,
     proc_manager: CoreEngineProcManager | None,
     coord_process: Process | None,
@@ -1170,20 +1203,30 @@ def wait_for_engine_startup(
 
         if status == "HELLO" and engine.state == CoreEngineState.NEW:
             # Send init message with DP config info.
+            parallel_config_payload: dict[str, int | str | list[int]] = {}
+            if coordinated_dp and send_parallel_config:
+                parallel_config_payload = {
+                    k: getattr(parallel_config, k)
+                    for k in (
+                        "data_parallel_master_ip",
+                        "data_parallel_master_port",
+                        "_data_parallel_master_port_list",
+                        "data_parallel_size",
+                    )
+                }
+                if parallel_config.enable_elastic_ep:
+                    if not parallel_config._coord_store_port:
+                        raise RuntimeError(
+                            "Elastic EP startup requires a coordination TCPStore "
+                            "port before engine handshake."
+                        )
+                    parallel_config_payload["_coord_store_port"] = (
+                        parallel_config._coord_store_port
+                    )
             init_message = msgspec.msgpack.encode(
                 EngineHandshakeMetadata(
                     addresses=addresses,
-                    parallel_config={
-                        k: getattr(parallel_config, k)
-                        for k in (
-                            "data_parallel_master_ip",
-                            "data_parallel_master_port",
-                            "_data_parallel_master_port_list",
-                            "data_parallel_size",
-                        )
-                    }
-                    if coordinated_dp
-                    else {},
+                    parallel_config=parallel_config_payload,
                 )
             )
             handshake_socket.send_multipart((eng_identity, init_message), copy=False)
