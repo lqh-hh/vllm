@@ -290,6 +290,31 @@ class EngineCore:
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.model_executor.supported_tasks
 
+    def get_runtime_parallel_config(self) -> dict[str, int | str | list[int]]:
+        """Return the engine's current runtime DP topology.
+
+        In external DP LB mode the API server process may not receive every
+        topology field during startup handshakes. The engine process is the
+        source of truth because it already applied any handshake-time updates.
+        """
+        parallel_config = self.vllm_config.parallel_config
+        return {
+            "data_parallel_size": parallel_config.data_parallel_size,
+            "data_parallel_rank": parallel_config.data_parallel_rank,
+            "data_parallel_rank_local": (
+                -1
+                if parallel_config.data_parallel_rank_local is None
+                else parallel_config.data_parallel_rank_local
+            ),
+            "data_parallel_master_ip": parallel_config.data_parallel_master_ip,
+            "data_parallel_master_port": parallel_config.data_parallel_master_port,
+            "data_parallel_master_port_list": (
+                parallel_config._data_parallel_master_port_list.copy()
+            ),
+            "coord_store_port": parallel_config._coord_store_port,
+            "data_parallel_rpc_port": parallel_config.data_parallel_rpc_port,
+        }
+
     def add_request(self, request: Request, request_wave: int = 0):
         """Add request to the scheduler.
 
@@ -942,6 +967,16 @@ class EngineCoreProc(EngineCore):
                 input_ctx, client_handshake_address, identity, True, False, vllm_config
             )
             with handshake as addresses, local_handshake as client_addresses:
+                if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
+                    self.eep_notification_addresses = EngineZmqAddresses(
+                        inputs=addresses.inputs.copy(),
+                        outputs=addresses.outputs.copy(),
+                        coordinator_input=addresses.coordinator_input,
+                        coordinator_output=addresses.coordinator_output,
+                        frontend_stats_publish_address=(
+                            addresses.frontend_stats_publish_address
+                        ),
+                    )
                 addresses.inputs = client_addresses.inputs
                 addresses.outputs = client_addresses.outputs
                 yield addresses
@@ -992,6 +1027,10 @@ class EngineCoreProc(EngineCore):
             if vllm_config.parallel_config.data_parallel_size > 1:
                 ready_msg["parallel_config_hash"] = (
                     vllm_config.parallel_config.compute_hash()
+                )
+            if vllm_config.parallel_config.enable_elastic_ep:
+                ready_msg["runtime_parallel_config"] = (
+                    self.get_runtime_parallel_config()
                 )
 
             handshake_socket.send(msgspec.msgpack.encode(ready_msg))
@@ -1833,7 +1872,20 @@ class DPEngineCoreProc(EngineCoreProc):
         )
         outputs.engine_index = self.engine_index
 
-        if hasattr(self, "output_thread") and self.output_thread.is_alive():
+        notification_addresses = getattr(self, "eep_notification_addresses", None)
+        if notification_addresses is not None:
+            encoder = MsgpackEncoder()
+            with (
+                zmq.Context() as ctx,
+                make_zmq_socket(
+                    ctx,
+                    notification_addresses.outputs[0],
+                    zmq.PUSH,
+                    linger=4000,
+                ) as socket,
+            ):
+                socket.send_multipart(encoder.encode(outputs))
+        elif hasattr(self, "output_thread") and self.output_thread.is_alive():
             self.output_queue.put_nowait((0, outputs))
         else:
             encoder = MsgpackEncoder()

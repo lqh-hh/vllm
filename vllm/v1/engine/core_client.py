@@ -12,9 +12,10 @@ from collections.abc import Awaitable, Callable, Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass
 from multiprocessing.queues import Queue
-from threading import Thread
+from threading import Event, Thread
 from typing import Any, TypeAlias, TypeVar
 
+import msgspec
 import msgspec.msgpack
 import zmq
 import zmq.asyncio
@@ -49,12 +50,15 @@ from vllm.v1.engine.tensor_ipc import TensorIpcSender
 from vllm.v1.engine.utils import (
     CoreEngineActorManager,
     CoreEngineProcManager,
+    EngineHandshakeMetadata,
+    EngineZmqAddresses,
     get_engine_zmq_addresses,
     launch_core_engines,
 )
 from vllm.v1.executor import Executor
 from vllm.v1.pool.late_interaction import get_late_interaction_engine_index
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
+from vllm.v1.utils import get_engine_client_zmq_addr
 
 logger = init_logger(__name__)
 
@@ -63,7 +67,6 @@ AnyFuture: TypeAlias = asyncio.Future[Any] | Future[Any]
 _R = TypeVar("_R")  # Return type for collective_rpc
 
 EngineIdentity = bytes
-
 
 class EngineCoreClient(ABC):
     """
@@ -454,6 +457,131 @@ class ElasticScalingCache:
     existing_core_engines: list[EngineIdentity]
     num_new_core_engines: int
     pending_notifications: dict[EEPNotificationType, set[int]]
+
+
+class ExternalElasticEPBootstrap(msgspec.Struct, omit_defaults=True):
+    epoch: str
+    old_data_parallel_size: int
+    new_data_parallel_size: int
+    new_data_parallel_master_ip: str
+    new_data_parallel_master_port: int
+    new_data_parallel_master_port_list: list[int]
+    coord_store_port: int
+
+
+class ExternalElasticEPScaleUpHandshakeServer:
+    """Temporary rank-0 handshake server for external EEP scale-up.
+
+    During normal external startup the global handshake listener only exists
+    while the rank starts. Scale-up needs the same handshake contract again for
+    newly launched ranks, so rank 0 re-opens a temporary listener for the
+    duration of the current epoch.
+    """
+
+    def __init__(
+        self,
+        *,
+        handshake_address: str,
+        expected_new_ranks: list[int],
+        addresses: EngineZmqAddresses,
+        bootstrap: ExternalElasticEPBootstrap,
+    ) -> None:
+        self.handshake_address = handshake_address
+        self.expected_new_ranks = set(expected_new_ranks)
+        self.addresses = addresses
+        self.bootstrap = bootstrap
+        self.started_event = Event()
+        self._stop_event = Event()
+        self._thread = Thread(
+            target=self._run,
+            name="ExternalElasticEPHandshakeServer",
+            daemon=True,
+        )
+        self._error: Exception | None = None
+
+    def start(self) -> None:
+        self._thread.start()
+        self.started_event.wait(timeout=5)
+        if self._error is not None:
+            raise self._error
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=5)
+        if self._error is not None:
+            raise self._error
+
+    def _run(self) -> None:
+        pending_ready_ranks = self.expected_new_ranks.copy()
+        try:
+            with (
+                zmq.Context() as ctx,
+                make_zmq_socket(
+                    ctx,
+                    self.handshake_address,
+                    zmq.ROUTER,
+                    bind=True,
+                    linger=0,
+                ) as handshake_socket,
+            ):
+                self.started_event.set()
+                poller = zmq.Poller()
+                poller.register(handshake_socket, zmq.POLLIN)
+
+                while not self._stop_event.is_set():
+                    if not pending_ready_ranks:
+                        return
+
+                    events = dict(poller.poll(timeout=1000))
+                    if handshake_socket not in events:
+                        continue
+
+                    eng_identity, payload = handshake_socket.recv_multipart()
+                    eng_rank = int.from_bytes(eng_identity, "little")
+                    if eng_rank not in self.expected_new_ranks:
+                        raise RuntimeError(
+                            "Received scale-up handshake from unexpected "
+                            f"dp rank {eng_rank}"
+                        )
+
+                    message = msgspec.msgpack.decode(payload)
+                    status = message["status"]
+                    if status == "HELLO":
+                        bootstrap = self.bootstrap
+                        init_message = msgspec.msgpack.encode(
+                            EngineHandshakeMetadata(
+                                addresses=self.addresses,
+                                parallel_config={
+                                    "data_parallel_master_ip": (
+                                        bootstrap.new_data_parallel_master_ip
+                                    ),
+                                    "data_parallel_master_port": (
+                                        bootstrap.new_data_parallel_master_port
+                                    ),
+                                    "_data_parallel_master_port_list": (
+                                        bootstrap.new_data_parallel_master_port_list
+                                    ),
+                                    "data_parallel_size": (
+                                        bootstrap.new_data_parallel_size
+                                    ),
+                                    "_coord_store_port": bootstrap.coord_store_port,
+                                },
+                            )
+                        )
+                        handshake_socket.send_multipart(
+                            (eng_identity, init_message), copy=False
+                        )
+                    elif status == "READY":
+                        pending_ready_ranks.discard(eng_rank)
+                    else:
+                        raise RuntimeError(
+                            f"Unexpected handshake status {status} from dp rank "
+                            f"{eng_rank}"
+                        )
+        except Exception as e:
+            self._error = e
+            self.started_event.set()
 
 
 class MPClient(EngineCoreClient):
@@ -903,13 +1031,16 @@ class AsyncMPClient(MPClient):
         output_handler: (
             Callable[[AsyncMPClient, EngineCoreOutputs], Awaitable[None]] | None
         ) = getattr(self.__class__, "process_engine_outputs", None)
-        _self_ref = weakref.ref(self) if output_handler else None
         output_socket = resources.output_socket
         assert output_socket is not None
 
         notification_callback_handler: (
             Callable[[AsyncMPClient, Sequence[Any]], Any] | None
         ) = getattr(self.__class__, "eep_process_engine_core_notification", None)
+        needs_self_ref = (
+            output_handler is not None or notification_callback_handler is not None
+        )
+        _self_ref = weakref.ref(self) if needs_self_ref else None
 
         async def process_outputs_socket():
             try:
@@ -1120,6 +1251,10 @@ class DPAsyncMPClient(AsyncMPClient):
         client_index: int = 0,
     ):
         self.current_wave = 0
+        self._external_eep_active_epoch: str | None = None
+        self._external_eep_active_epoch_store: tuple[str, int] | None = None
+        self._external_eep_previous_coord_store: Any | None = None
+        self._external_eep_epoch_store_ref: Any | None = None
 
         super().__init__(
             vllm_config,
@@ -1284,6 +1419,524 @@ class DPAsyncMPClient(AsyncMPClient):
 
     def get_core_engine_for_request(self, request: EngineCoreRequest):
         return self.core_engine
+
+    @staticmethod
+    def _external_eep_key(*parts: str | int) -> str:
+        return "/".join(["elastic_ep/external", *[str(part) for part in parts]])
+
+    def _apply_runtime_parallel_config(
+        self, runtime_config: dict[str, Any] | ExternalElasticEPBootstrap
+    ) -> None:
+        parallel_config = self.vllm_config.parallel_config
+        if isinstance(runtime_config, ExternalElasticEPBootstrap):
+            parallel_config.data_parallel_size = runtime_config.new_data_parallel_size
+            parallel_config.data_parallel_master_ip = (
+                runtime_config.new_data_parallel_master_ip
+            )
+            parallel_config.data_parallel_master_port = (
+                runtime_config.new_data_parallel_master_port
+            )
+            parallel_config._data_parallel_master_port_list = (
+                runtime_config.new_data_parallel_master_port_list.copy()
+            )
+            parallel_config._coord_store_port = runtime_config.coord_store_port
+            return
+
+        parallel_config.data_parallel_size = runtime_config["data_parallel_size"]
+        parallel_config.data_parallel_rank = runtime_config["data_parallel_rank"]
+        local_rank = runtime_config["data_parallel_rank_local"]
+        parallel_config.data_parallel_rank_local = (
+            None if local_rank == -1 else local_rank
+        )
+        parallel_config.data_parallel_master_ip = runtime_config[
+            "data_parallel_master_ip"
+        ]
+        parallel_config.data_parallel_master_port = runtime_config[
+            "data_parallel_master_port"
+        ]
+        parallel_config._data_parallel_master_port_list = runtime_config[
+            "data_parallel_master_port_list"
+        ]
+        parallel_config._coord_store_port = runtime_config["coord_store_port"]
+        parallel_config.data_parallel_rpc_port = runtime_config[
+            "data_parallel_rpc_port"
+        ]
+
+    def _get_external_epoch_store(self):
+        from vllm.distributed.utils import get_cached_tcp_store_client
+
+        if self._external_eep_active_epoch_store is not None:
+            store_addr = self._external_eep_active_epoch_store
+        else:
+            parallel_config = self.vllm_config.parallel_config
+            if not parallel_config._coord_store_port:
+                raise RuntimeError(
+                    "External Elastic EP requires an active epoch coordination store."
+                )
+            store_addr = (
+                parallel_config.data_parallel_master_ip,
+                parallel_config._coord_store_port,
+            )
+
+        return get_cached_tcp_store_client(*store_addr)
+
+    def _get_external_scale_up_global_addresses(self) -> EngineZmqAddresses:
+        coordinator = self.resources.coordinator
+        if coordinator is None:
+            raise RuntimeError(
+                "External Elastic EP scale-up requires rank 0 to own a DP "
+                "coordinator."
+            )
+        coordinator_input, coordinator_output = (
+            coordinator.get_engine_socket_addresses()
+        )
+        stats_publish_address = coordinator.get_stats_publish_address()
+
+        input_endpoint = self.input_socket.getsockopt_string(zmq.LAST_ENDPOINT)
+        output_socket = self.resources.output_socket
+        output_endpoint = (
+            output_socket.getsockopt_string(zmq.LAST_ENDPOINT)
+            if output_socket is not None
+            else ""
+        )
+
+        return EngineZmqAddresses(
+            inputs=[input_endpoint],
+            outputs=[output_endpoint],
+            coordinator_input=coordinator_input,
+            coordinator_output=coordinator_output,
+            frontend_stats_publish_address=stats_publish_address,
+        )
+
+    def _setup_elastic_ep_reconfig_bootstrap(self) -> tuple[str, int]:
+        from vllm.distributed.utils import create_tcp_store
+        from vllm.utils.network_utils import get_open_ports_list
+
+        parallel_config = self.vllm_config.parallel_config
+        parallel_config._data_parallel_master_port_list = get_open_ports_list(5)
+        parallel_config.data_parallel_master_port = (
+            parallel_config._data_parallel_master_port_list.pop()
+        )
+
+        ip = parallel_config.data_parallel_master_ip
+        store = create_tcp_store(
+            ip,
+            0,
+            is_master=True,
+            world_size=-1,
+            wait_for_workers=False,
+        )
+        parallel_config._coord_store_port = store.port
+        self._external_eep_epoch_store_ref = store
+        self._coord_store = store
+        return ip, store.port
+
+    def _get_external_eep_error(self, store: Any, epoch: str) -> str | None:
+        error_key = self._external_eep_key(epoch, "error")
+        if not store.check([error_key]):
+            return None
+        return store.get(error_key).decode()
+
+    async def _wait_for_external_bootstrap(
+        self,
+        store: Any,
+        requested_new_dp_size: int,
+        timeout_s: float = 300,
+    ) -> ExternalElasticEPBootstrap:
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+        while True:
+            current_epoch_key = self._external_eep_key("current_epoch")
+            if store.check([current_epoch_key]):
+                epoch = store.get(current_epoch_key).decode()
+                error = self._get_external_eep_error(store, epoch)
+                if error is not None:
+                    raise RuntimeError(error)
+                bootstrap_key = self._external_eep_key(epoch, "bootstrap")
+                if store.check([bootstrap_key]):
+                    bootstrap = msgspec.msgpack.decode(
+                        store.get(bootstrap_key),
+                        type=ExternalElasticEPBootstrap,
+                    )
+                    completed = store.check(
+                        [self._external_eep_key(epoch, "completed")]
+                    )
+                    if bootstrap.new_data_parallel_size != requested_new_dp_size:
+                        if (
+                            store.check([self._external_eep_key(epoch, "prepared")])
+                            and not completed
+                        ):
+                            raise RuntimeError(
+                                "A different external Elastic EP scaling epoch is "
+                                f"already in progress for target dp size "
+                                f"{bootstrap.new_data_parallel_size}."
+                            )
+                    elif (
+                        store.check([self._external_eep_key(epoch, "prepared")])
+                        and not completed
+                    ):
+                        return bootstrap
+
+            if loop.time() - start > timeout_s:
+                raise TimeoutError(
+                    "Timed out waiting for rank 0 to publish external Elastic EP "
+                    "bootstrap metadata."
+                )
+            await asyncio.sleep(0.1)
+
+    def _prepare_external_reconfig_bootstrap(
+        self,
+        store: Any,
+        cur_data_parallel_size: int,
+        new_data_parallel_size: int,
+    ) -> ExternalElasticEPBootstrap:
+        current_epoch_key = self._external_eep_key("current_epoch")
+        if store.check([current_epoch_key]):
+            current_epoch = store.get(current_epoch_key).decode()
+            current_error = self._get_external_eep_error(store, current_epoch)
+            if (
+                current_error is None
+                and not store.check(
+                    [self._external_eep_key(current_epoch, "completed")]
+                )
+            ):
+                raise RuntimeError(
+                    "Another external Elastic EP scaling epoch is already active."
+                )
+
+        ip, coord_store_port = self._setup_elastic_ep_reconfig_bootstrap()
+        epoch = uuid.uuid4().hex
+        bootstrap = ExternalElasticEPBootstrap(
+            epoch=epoch,
+            old_data_parallel_size=cur_data_parallel_size,
+            new_data_parallel_size=new_data_parallel_size,
+            new_data_parallel_master_ip=ip,
+            new_data_parallel_master_port=(
+                self.vllm_config.parallel_config.data_parallel_master_port
+            ),
+            new_data_parallel_master_port_list=(
+                self.vllm_config.parallel_config._data_parallel_master_port_list.copy()
+            ),
+            coord_store_port=coord_store_port,
+        )
+
+        bootstrap_key = self._external_eep_key(epoch, "bootstrap")
+        store.set(current_epoch_key, epoch.encode())
+        store.set(bootstrap_key, msgspec.msgpack.encode(bootstrap))
+        return bootstrap
+
+    def _start_external_scale_up_handshake_server(
+        self,
+        bootstrap: ExternalElasticEPBootstrap,
+    ) -> ExternalElasticEPScaleUpHandshakeServer:
+        handshake_server = ExternalElasticEPScaleUpHandshakeServer(
+            handshake_address=get_engine_client_zmq_addr(
+                False,
+                bootstrap.new_data_parallel_master_ip,
+                self.vllm_config.parallel_config.data_parallel_rpc_port,
+            ),
+            expected_new_ranks=list(
+                range(
+                    bootstrap.old_data_parallel_size,
+                    bootstrap.new_data_parallel_size,
+                )
+            ),
+            addresses=self._get_external_scale_up_global_addresses(),
+            bootstrap=bootstrap,
+        )
+        handshake_server.start()
+        return handshake_server
+
+    async def _wait_for_external_notification(
+        self,
+        control_store: Any,
+        epoch_store: Any,
+        bootstrap: ExternalElasticEPBootstrap,
+        notification_type: EEPNotificationType,
+        source_ranks: Sequence[int],
+        timeout_s: float = 300,
+    ) -> None:
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+        while True:
+            error = self._get_external_eep_error(control_store, bootstrap.epoch)
+            if error is not None:
+                raise RuntimeError(
+                    error
+                    or "External Elastic EP scaling failed while waiting for "
+                    f"{notification_type.value}."
+                )
+
+            ready_count = sum(
+                1
+                for rank in source_ranks
+                if epoch_store.check(
+                    [
+                        self._external_eep_key(
+                            bootstrap.epoch,
+                            "notifications",
+                            notification_type.value,
+                            rank,
+                        )
+                    ]
+                )
+            )
+            if ready_count >= len(source_ranks):
+                await self.call_utility_async(
+                    "eep_handle_engine_core_notification",
+                    notification_type.value,
+                )
+                return
+
+            if loop.time() - start > timeout_s:
+                raise TimeoutError(
+                    "Timed out waiting for external Elastic EP notification "
+                    f"{notification_type.value}."
+                )
+            await asyncio.sleep(0.1)
+
+    async def _wait_for_external_reconfig_finished(
+        self,
+        control_store: Any,
+        epoch_store: Any,
+        bootstrap: ExternalElasticEPBootstrap,
+        dp_rank: int,
+        scale_up: bool,
+        timeout_s: float = 300,
+    ) -> None:
+        finished_key = self._external_eep_key(
+            bootstrap.epoch, "old_rank_finished", 0
+        )
+        if scale_up:
+            wait_keys = [finished_key]
+            timeout_msg = "Timed out waiting for external Elastic EP scale-up to finish."
+        else:
+            removed_ranks = range(
+                bootstrap.new_data_parallel_size,
+                bootstrap.old_data_parallel_size,
+            )
+            shutdown_keys = [
+                self._external_eep_key(bootstrap.epoch, "shutdown_complete", rank)
+                for rank in removed_ranks
+            ]
+            wait_keys = (
+                [self._external_eep_key(bootstrap.epoch, "shutdown_complete", dp_rank)]
+                if dp_rank >= bootstrap.new_data_parallel_size
+                else [finished_key, *shutdown_keys]
+            )
+            timeout_msg = (
+                "Timed out waiting for external Elastic EP scale-down to finish."
+            )
+
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+        while True:
+            error = self._get_external_eep_error(control_store, bootstrap.epoch)
+            if error is not None:
+                raise RuntimeError(
+                    error or "External Elastic EP scaling failed on another rank."
+                )
+
+            if all(epoch_store.check([key]) for key in wait_keys):
+                return
+
+            if loop.time() - start > timeout_s:
+                raise TimeoutError(timeout_msg)
+            await asyncio.sleep(0.1)
+
+    async def _scale_external_elastic_ep(
+        self, cur_data_parallel_size: int, new_data_parallel_size: int
+    ) -> None:
+        from vllm.distributed.utils import get_cached_tcp_store_client
+
+        parallel_config = self.vllm_config.parallel_config
+        dp_rank = parallel_config.data_parallel_rank
+        scale_up = new_data_parallel_size > cur_data_parallel_size
+        if not parallel_config._coord_store_port:
+            raise RuntimeError(
+                "External Elastic EP requires a runtime coordination store port."
+            )
+        control_store = get_cached_tcp_store_client(
+            parallel_config.data_parallel_master_ip,
+            parallel_config._coord_store_port,
+        )
+        handshake_server: ExternalElasticEPScaleUpHandshakeServer | None = None
+        bootstrap: ExternalElasticEPBootstrap | None = None
+
+        try:
+            if dp_rank == 0:
+                self._external_eep_previous_coord_store = getattr(
+                    self, "_coord_store", None
+                )
+                bootstrap = self._prepare_external_reconfig_bootstrap(
+                    control_store,
+                    cur_data_parallel_size,
+                    new_data_parallel_size,
+                )
+                if scale_up:
+                    handshake_server = self._start_external_scale_up_handshake_server(
+                        bootstrap
+                    )
+                control_store.set(
+                    self._external_eep_key(bootstrap.epoch, "prepared"), b"1"
+                )
+            else:
+                bootstrap = await self._wait_for_external_bootstrap(
+                    control_store, new_data_parallel_size
+                )
+
+            self._external_eep_active_epoch = bootstrap.epoch
+            self._external_eep_active_epoch_store = (
+                bootstrap.new_data_parallel_master_ip,
+                bootstrap.coord_store_port,
+            )
+            epoch_store = self._get_external_epoch_store()
+
+            reconfig_rank = (
+                ReconfigureRankType.SHUTDOWN_CURRENT_RANK
+                if (
+                    not scale_up and dp_rank >= bootstrap.new_data_parallel_size
+                )
+                else ReconfigureRankType.KEEP_CURRENT_RANK
+            )
+            reconfig_request = ReconfigureDistributedRequest(
+                new_data_parallel_size=bootstrap.new_data_parallel_size,
+                new_data_parallel_rank=reconfig_rank,
+                new_data_parallel_rank_local=ReconfigureRankType.KEEP_CURRENT_RANK,
+                new_data_parallel_master_ip=bootstrap.new_data_parallel_master_ip,
+                new_data_parallel_master_port=bootstrap.new_data_parallel_master_port,
+                new_data_parallel_master_port_list=(
+                    bootstrap.new_data_parallel_master_port_list
+                ),
+                coord_store_port=bootstrap.coord_store_port,
+            )
+            await self.call_utility_async(
+                "reinitialize_distributed", reconfig_request
+            )
+
+            if scale_up:
+                new_ranks = list(
+                    range(
+                        bootstrap.old_data_parallel_size,
+                        bootstrap.new_data_parallel_size,
+                    )
+                )
+                await self._wait_for_external_notification(
+                    control_store,
+                    epoch_store,
+                    bootstrap,
+                    EEPNotificationType.NEW_CORE_ENGINES_INIT_READY,
+                    new_ranks,
+                )
+                await self._wait_for_external_notification(
+                    control_store,
+                    epoch_store,
+                    bootstrap,
+                    EEPNotificationType.NEW_CORE_ENGINES_WEIGHTS_INIT_READY,
+                    new_ranks,
+                )
+
+            await self._wait_for_external_reconfig_finished(
+                control_store,
+                epoch_store,
+                bootstrap,
+                dp_rank,
+                scale_up,
+            )
+            if scale_up or dp_rank < bootstrap.new_data_parallel_size:
+                control_store.set(
+                    self._external_eep_key(bootstrap.epoch, "completed"), b"1"
+                )
+                self._apply_runtime_parallel_config(bootstrap)
+        except Exception as e:
+            if bootstrap is not None:
+                control_store.set(
+                    self._external_eep_key(bootstrap.epoch, "error"),
+                    str(e).encode(),
+                )
+            raise
+        finally:
+            if handshake_server is not None:
+                with contextlib.suppress(Exception):
+                    handshake_server.stop()
+
+    @staticmethod
+    async def eep_process_engine_core_notification(
+        self: "DPAsyncMPClient", notification_data: tuple[str, int]
+    ) -> None:
+        parallel_config = self.vllm_config.parallel_config
+        if not (
+            parallel_config.enable_elastic_ep
+            and parallel_config.data_parallel_external_lb
+        ):
+            return
+
+        notification_type_str, dp_rank = notification_data
+        notification_type = EEPNotificationType(notification_type_str)
+        epoch = self._external_eep_active_epoch
+        if not parallel_config._coord_store_port:
+            logger.warning(
+                "Ignoring external Elastic EP notification %s because coord "
+                "store metadata is not available yet.",
+                notification_type.value,
+            )
+            return
+
+        epoch_store = self._get_external_epoch_store()
+        if epoch is None:
+            current_epoch_key = self._external_eep_key("current_epoch")
+            if not epoch_store.check([current_epoch_key]):
+                logger.warning(
+                    "Ignoring external Elastic EP notification %s because "
+                    "active epoch metadata is not available yet.",
+                    notification_type.value,
+                )
+                return
+            epoch = epoch_store.get(current_epoch_key).decode()
+
+        if notification_type in (
+            EEPNotificationType.NEW_CORE_ENGINES_INIT_READY,
+            EEPNotificationType.NEW_CORE_ENGINES_WEIGHTS_INIT_READY,
+        ):
+            epoch_store.set(
+                self._external_eep_key(
+                    epoch, "notifications", notification_type.value, dp_rank
+                ),
+                b"1",
+            )
+        elif notification_type == EEPNotificationType.RECONFIGURE_FINISHED:
+            epoch_store.set(
+                self._external_eep_key(epoch, "old_rank_finished", dp_rank), b"1"
+            )
+        elif notification_type == EEPNotificationType.SHUTDOWN_COMPLETE:
+            epoch_store.set(
+                self._external_eep_key(epoch, "shutdown_complete", dp_rank), b"1"
+            )
+
+    async def scale_elastic_ep(self, new_data_parallel_size: int) -> None:
+        runtime_config = await self.call_utility_async("get_runtime_parallel_config")
+        assert isinstance(runtime_config, dict)
+        self._apply_runtime_parallel_config(runtime_config)
+        cur_data_parallel_size = self.vllm_config.parallel_config.data_parallel_size
+
+        assert new_data_parallel_size != cur_data_parallel_size, (
+            f"new_data_parallel_size {new_data_parallel_size} must be "
+            f"different from cur_data_parallel_size {cur_data_parallel_size}"
+        )
+
+        parallel_config = self.vllm_config.parallel_config
+        if not parallel_config.enable_elastic_ep:
+            raise NotImplementedError(
+                "Elastic EP scaling requires enable_elastic_ep=True."
+            )
+        if not parallel_config.data_parallel_external_lb:
+            raise NotImplementedError(
+                "DPAsyncMPClient only supports Elastic EP scaling in external "
+                "load-balancer mode."
+            )
+        await self._scale_external_elastic_ep(
+            cur_data_parallel_size, new_data_parallel_size
+        )
 
 
 class DPLBAsyncMPClient(DPAsyncMPClient):
@@ -1488,28 +2141,6 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         self.utility_results[EEP_NOTIFICATION_CALL_ID] = future
         self._ensure_output_queue_task()
         await future
-
-    def _setup_elastic_ep_reconfig_bootstrap(self) -> tuple[str, int]:
-        from vllm.distributed.utils import create_tcp_store
-        from vllm.utils.network_utils import get_open_ports_list
-
-        parallel_config = self.vllm_config.parallel_config
-        parallel_config._data_parallel_master_port_list = get_open_ports_list(5)
-        parallel_config.data_parallel_master_port = (
-            parallel_config._data_parallel_master_port_list.pop()
-        )
-
-        ip = parallel_config.data_parallel_master_ip
-        store = create_tcp_store(
-            ip,
-            0,
-            is_master=True,
-            world_size=-1,
-            wait_for_workers=False,
-        )
-        parallel_config._coord_store_port = store.port
-        self._coord_store = store
-        return ip, store.port
 
     async def _scale_up_elastic_ep(
         self, cur_data_parallel_size: int, new_data_parallel_size: int
