@@ -25,7 +25,7 @@ if TYPE_CHECKING:
     from vllm.v1.engine.core_client import DPAsyncMPClient
 
 logger = init_logger(__name__)
-POLL_BACKOFF_STEPS_S = (0.1, 0.2, 0.5, 1.0)
+POLL_BACKOFF_STEPS_S = (0.1, 0.2, 0.4, 0.8)
 
 
 class ExternalElasticEPScaleUpHandshakeServer:
