@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import contextlib
+import sys
 import uuid
 from collections.abc import Sequence
 from threading import Event, Thread
@@ -78,6 +80,10 @@ class ExternalElasticEPScaleUpHandshakeServer:
         self._stop_event.set()
         if self._thread.is_alive():
             self._thread.join(timeout=5)
+        if self._error is not None:
+            raise self._error
+
+    def raise_if_failed(self) -> None:
         if self._error is not None:
             raise self._error
 
@@ -356,6 +362,7 @@ class ExternalElasticEPScaleCoordinator:
         epoch: str,
         notification_type: EEPNotificationType,
         source_ranks: Sequence[int],
+        handshake_server: ExternalElasticEPScaleUpHandshakeServer | None = None,
         timeout_s: float = 300,
     ) -> None:
         """Wait for source ranks to publish a specific scale notification.
@@ -369,6 +376,9 @@ class ExternalElasticEPScaleCoordinator:
 
         backoff_step = 0
         while True:
+            if handshake_server is not None:
+                handshake_server.raise_if_failed()
+
             error = self._get_error(control_store, epoch)
             if error is not None:
                 raise RuntimeError(
@@ -515,6 +525,7 @@ class ExternalElasticEPScaleCoordinator:
                     epoch,
                     EEPNotificationType.NEW_CORE_ENGINES_INIT_READY,
                     new_ranks,
+                    handshake_server=handshake_server,
                 )
                 await self._wait_for_notification(
                     control_store,
@@ -522,6 +533,7 @@ class ExternalElasticEPScaleCoordinator:
                     epoch,
                     EEPNotificationType.NEW_CORE_ENGINES_WEIGHTS_INIT_READY,
                     new_ranks,
+                    handshake_server=handshake_server,
                 )
 
             await self._wait_for_local_reconfig_finished(
@@ -550,7 +562,11 @@ class ExternalElasticEPScaleCoordinator:
             raise
         finally:
             if handshake_server is not None:
-                handshake_server.stop()
+                if sys.exc_info()[0] is None:
+                    handshake_server.stop()
+                else:
+                    with contextlib.suppress(Exception):
+                        handshake_server.stop()
 
     async def process_engine_core_notification(
         self, notification_data: tuple[str, int]
