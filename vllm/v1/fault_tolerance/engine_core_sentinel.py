@@ -286,6 +286,9 @@ class EngineCoreSentinel:
         worker_port = self._coordinate_port("ft_worker_dp_port")
         engine_port = self._coordinate_port("ft_engine_dp_port")
         eplb_port = self._coordinate_port("ft_engine_eplb_port")
+        worker_coord_store_port = self._coordinate_port(
+            "ft_worker_coord_store_port"
+        )
         self._dp_reinit_epoch += 1
 
         stateless_destroy_torch_distributed_process_group(engine.dp_group)
@@ -302,6 +305,7 @@ class EngineCoreSentinel:
         return {
             "new_stateless_dp_group_port": worker_port,
             "new_stateless_eplb_group_port": eplb_port,
+            "new_stateless_coord_store_port": worker_coord_store_port,
         }
 
     def _coordinate_port(self, key_prefix: str) -> int:

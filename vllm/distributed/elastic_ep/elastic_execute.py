@@ -328,6 +328,14 @@ class ElasticEPScalingExecutor:
             staged_quant_method.moe_kernel.prepare_finalize.on_commit()
         self._staged_moe_quant_methods.clear()
 
+    def materialize_new_communication_groups(self) -> None:
+        """Hook for device-specific communicators used by elastic scale-up."""
+        return
+
+    def run_new_rank_capture_dp_companion(self) -> None:
+        """Hook for platform-specific new-rank graph-capture DP sync."""
+        return
+
     def _release_cuda_graphs(self) -> None:
         if isinstance(self.worker.model_runner.model, CUDAGraphWrapper):
             wrapper = self.worker.model_runner.model

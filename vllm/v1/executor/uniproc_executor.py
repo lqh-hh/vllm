@@ -46,6 +46,9 @@ class UniProcExecutor(Executor):
     def _init_executor(self) -> None:
         """Initialize the worker and load the model."""
         self.driver_worker = WorkerWrapperBase(rpc_rank=0)
+        self.elastic_ep_dp_collective_states = [
+            torch.full((2,), -1, dtype=torch.int64).share_memory_()
+        ]
         distributed_init_method, rank, local_rank = self._distributed_args()
         kwargs = dict(
             vllm_config=self.vllm_config,
@@ -54,6 +57,7 @@ class UniProcExecutor(Executor):
             distributed_init_method=distributed_init_method,
             is_driver_worker=True,
             shared_worker_lock=Lock(),
+            elastic_ep_dp_collective_state=self.elastic_ep_dp_collective_states[0],
         )
 
         # Set net device env vars for the worker if VLLM_GPU_NIC_PCIE_MAPPING is set
@@ -67,6 +71,18 @@ class UniProcExecutor(Executor):
         else:
             self.driver_worker.load_model()
         current_platform.update_block_size_for_backend(self.vllm_config)
+
+    def get_elastic_ep_dp_collective_states(self) -> list[tuple[int, int]]:
+        snapshots = []
+        for state in self.elastic_ep_dp_collective_states:
+            while True:
+                entered_before = int(state[0].item())
+                completed = int(state[1].item())
+                entered_after = int(state[0].item())
+                if entered_before == entered_after and completed <= entered_after:
+                    snapshots.append((entered_after, completed))
+                    break
+        return snapshots
 
     def _distributed_args(self) -> tuple[str, int, int]:
         """Return (distributed_init_method, rank, local_rank)."""

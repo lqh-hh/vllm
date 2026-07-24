@@ -1035,18 +1035,44 @@ class AsyncLLM(EngineClient):
                 self._logger_ref[0] = self.logger_manager
             self.logger_manager.log_engine_initialized()
 
-        set_scaling_elastic_ep(True)
+        block_requests_during_scaling = (
+            os.getenv("VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3", "0") != "1"
+        )
+        if block_requests_during_scaling:
+            set_scaling_elastic_ep(True)
         try:
             await self.engine_core.scale_elastic_ep(new_data_parallel_size)
             self.vllm_config.parallel_config.data_parallel_size = new_data_parallel_size
         finally:
-            set_scaling_elastic_ep(False)
+            if block_requests_during_scaling:
+                set_scaling_elastic_ep(False)
 
     async def handle_fault(
         self, fault_tolerance_request: FaultToleranceRequest
     ) -> FaultToleranceResult:
         """send fault tolerance instruction to the engine"""
-        return await self.engine_core.handle_fault(fault_tolerance_request)
+        result = await self.engine_core.handle_fault(fault_tolerance_request)
+        if result.success and fault_tolerance_request.instruction == "scale_down":
+            parallel_config = self.vllm_config.parallel_config
+            old_dp_size = parallel_config.data_parallel_size
+            old_dp_rank = parallel_config.data_parallel_rank
+            removed_dp_ranks = fault_tolerance_request.params["removed_dp_ranks"]
+            removed_set = set(removed_dp_ranks)
+
+            parallel_config.data_parallel_size = old_dp_size - len(removed_dp_ranks)
+            parallel_config.data_parallel_rank = old_dp_rank - sum(
+                rank < old_dp_rank for rank in removed_set
+            )
+            logger.info(
+                "[FT] Synchronized frontend DP config after scale_down: "
+                "dp_size %d->%d, dp_rank %d->%d, removed %s",
+                old_dp_size,
+                parallel_config.data_parallel_size,
+                old_dp_rank,
+                parallel_config.data_parallel_rank,
+                removed_dp_ranks,
+            )
+        return result
 
     async def get_status(self):
         return await self.engine_core.get_status()

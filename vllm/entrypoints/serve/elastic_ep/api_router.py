@@ -3,6 +3,7 @@
 
 
 import json
+import os
 from http import HTTPStatus
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
@@ -27,6 +28,10 @@ def engine_client(request: Request) -> EngineClient:
 
 
 router = APIRouter()
+
+
+def _should_set_scaling_elastic_ep() -> bool:
+    return os.getenv("VLLM_ASCEND_ENABLE_MOE_DISTRIBUTE_V3", "0") != "1"
 
 
 @router.post(
@@ -64,8 +69,9 @@ async def scale_elastic_ep(raw_request: Request):
             status_code=400, detail="drain_timeout must be a positive integer"
         )
 
-    # Set scaling flag to prevent new requests
-    set_scaling_elastic_ep(True)
+    block_requests_during_scaling = _should_set_scaling_elastic_ep()
+    if block_requests_during_scaling:
+        set_scaling_elastic_ep(True)
     client = engine_client(raw_request)
     try:
         await client.scale_elastic_ep(new_data_parallel_size, drain_timeout)
@@ -84,7 +90,8 @@ async def scale_elastic_ep(raw_request: Request):
         logger.error("Scale failed: %s", e)
         raise HTTPException(status_code=500, detail="Scale failed") from e
     finally:
-        set_scaling_elastic_ep(False)
+        if block_requests_during_scaling:
+            set_scaling_elastic_ep(False)
 
 
 @router.post("/is_scaling_elastic_ep")

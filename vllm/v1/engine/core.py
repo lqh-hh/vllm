@@ -452,6 +452,9 @@ class EngineCore:
         was executed.
         """
 
+        if getattr(self, "_eep_drain_batch_queue", False):
+            return {}, False
+
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
@@ -511,9 +514,10 @@ class EngineCore:
         # Note that this is not blocking.
         assert len(batch_queue) < self.batch_queue_size
 
+        drain_batch_queue = getattr(self, "_eep_drain_batch_queue", False)
         model_executed = False
         deferred_scheduler_output = None
-        if self.scheduler.has_requests():
+        if self.scheduler.has_requests() and not drain_batch_queue:
             scheduler_output = self.scheduler.schedule()
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
@@ -554,6 +558,8 @@ class EngineCore:
             # Queue is empty. We should not reach here since this method should
             # only be called when the scheduler contains requests or the queue
             # is non-empty.
+            if drain_batch_queue and getattr(self, "eep_scaling_state", None) is None:
+                self._eep_drain_batch_queue = False
             return None, False
 
         # Block until the next result is available.
@@ -1930,7 +1936,12 @@ class DPEngineCoreProc(EngineCoreProc):
             # Publish request counts before and after GPU step to ensure freshness.
             self._maybe_publish_request_counts()
 
-            if self.eep_scaling_state is not None:
+            progress_eep_after_step = (
+                self.eep_scaling_state is not None
+                and self.engines_running
+                and self.eep_scaling_state.should_progress_after_model_step()
+            )
+            if self.eep_scaling_state is not None and not progress_eep_after_step:
                 _ = self.eep_scaling_state.progress()
                 if self.eep_scaling_state.is_complete():
                     if self.eep_scaling_state.worker_type == "removing":
@@ -1950,15 +1961,31 @@ class DPEngineCoreProc(EngineCoreProc):
                     # All engines are idle.
                     continue
 
-                # We are in a running state and so must execute a dummy pass
-                # if the model didn't execute any ready requests.
-                with self.log_iteration_details(None):
-                    self.execute_dummy_batch()
+                skip_dummy_batch = (
+                    self.eep_scaling_state is not None
+                    and self.eep_scaling_state.should_skip_dummy_batch()
+                )
+                if not skip_dummy_batch:
+                    # We are in a running state and so must execute a dummy pass
+                    # if the model didn't execute any ready requests.
+                    with self.log_iteration_details(None):
+                        self.execute_dummy_batch()
 
             # 3) All-reduce operation to determine global unfinished reqs.
             self.engines_running = self._has_global_unfinished_reqs(
                 local_unfinished_reqs
             )
+
+            if self.eep_scaling_state is not None and progress_eep_after_step:
+                _ = self.eep_scaling_state.progress()
+                if self.eep_scaling_state.is_complete():
+                    if self.eep_scaling_state.worker_type == "removing":
+                        raise SystemExit
+                    if self.eep_scaling_state.worker_type == "new":
+                        self.eep_notification_addresses = None
+                        self._close_eep_notification_socket()
+                    self.process_input_queue_block = True
+                    self.eep_scaling_state = None
 
             if not self.engines_running:
                 if self.dp_rank == 0 or not self.has_coordinator:
@@ -1983,9 +2010,27 @@ class DPEngineCoreProc(EngineCoreProc):
         raise SystemExit
 
     def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
-        # Optimization - only perform finish-sync all-reduce every 32 steps.
+        if (
+            self.eep_scaling_state is not None
+            and self.eep_scaling_state.should_defer_dp_state_sync()
+        ):
+            # The transfer-weights quiesce protocol uses Worker collective
+            # epochs published through TCPStore. Entering the regular
+            # EngineCore all-reduce before every Worker reaches the target
+            # epoch can create a cross-level collective deadlock.
+            return True
+
+        # Normally perform finish-sync every 32 steps. During the scale-up
+        # capture window all old ranks enter with an aligned step counter, so a
+        # shorter interval can reduce ready-to-pause latency without changing
+        # collective ordering across ranks.
         self.step_counter += 1
-        if self.step_counter % 32 != 0:
+        sync_interval = (
+            self.eep_scaling_state.dp_state_sync_interval()
+            if self.eep_scaling_state is not None
+            else 32
+        )
+        if self.step_counter % sync_interval != 0:
             return True
 
         has_unfinished, pause_consensus = ParallelConfig.sync_dp_state(
