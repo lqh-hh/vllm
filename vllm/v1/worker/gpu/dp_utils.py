@@ -2,8 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from __future__ import annotations
 
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
+
 import torch
 import torch.distributed as dist
+from torch.distributed import ProcessGroup
 
 from vllm.config import ParallelConfig
 from vllm.config.compilation import CUDAGraphMode
@@ -12,6 +17,28 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
     CudaGraphManager,
 )
+
+_DP_SYNC_OVERRIDE: ContextVar[
+    tuple[ProcessGroup, Callable[[], None] | None] | None
+] = ContextVar("vllm_dp_sync_override", default=None)
+
+
+@contextmanager
+def override_dp_sync_group(
+    group: ProcessGroup,
+    before_all_reduce: Callable[[], None] | None = None,
+) -> Iterator[None]:
+    """Temporarily route DP graph-metadata collectives to another group.
+
+    Platform backends can use this while preparing a future DP topology. The
+    context is local to the current execution context and does not affect
+    normal serving threads.
+    """
+    token = _DP_SYNC_OVERRIDE.set((group, before_all_reduce))
+    try:
+        yield
+    finally:
+        _DP_SYNC_OVERRIDE.reset(token)
 
 
 def sync_cudagraph_and_dp_padding(
@@ -32,12 +59,19 @@ def sync_cudagraph_and_dp_padding(
     Returns (synced_batch_desc, num_tokens_across_dp).
     """
     assert dp_size > 1, "DP size must be greater than 1"
-    group = get_dp_group().cpu_group
+    sync_override = _DP_SYNC_OVERRIDE.get()
+    if sync_override is None:
+        group = get_dp_group().cpu_group
+        before_all_reduce = None
+    else:
+        group, before_all_reduce = sync_override
     tensor = torch.zeros(4, dp_size, dtype=torch.int32, device="cpu")
     tensor[0][dp_rank] = num_tokens
     tensor[1][dp_rank] = desired_batch_desc.cg_mode.value
     tensor[2][dp_rank] = uniform_token_count or 0  # (0 means None)
     tensor[3][dp_rank] = max_query_len or -1  # (-1 means None)
+    if before_all_reduce is not None:
+        before_all_reduce()
     dist.all_reduce(tensor, group=group)
 
     if parallel_config.enable_fault_tolerance:

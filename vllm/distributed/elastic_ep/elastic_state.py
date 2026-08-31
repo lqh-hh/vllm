@@ -32,8 +32,9 @@ WorkerType = Literal["existing", "new", "removing"]
 class ScaleUpExistingEngineState(enum.IntEnum):
     PREPARE = 0
     SYNC_KV_CACHE_MEMORY_SIZE = 1
-    COMMIT_SCALE_UP = 2  # Blocks forward passes.
-    COMPLETE = 3
+    CAPTURE_NEW_RANKS = 2
+    COMMIT_SCALE_UP = 3  # Blocks forward passes.
+    COMPLETE = 4
 
 
 class ScaleUpNewEngineState(enum.IntEnum):
@@ -88,6 +89,8 @@ class ElasticEPScalingState:
         )
         self._prepare_future: Future[Any] | None = None
         self._new_dp_sync: tuple[object, Any] | None = None
+        self._precommit_capture_enabled: bool | None = None
+        self._precommit_operation_id = ""
         self.state: EngineState
         if scale_type == "scale_up":
             self.state = (
@@ -173,6 +176,19 @@ class ElasticEPScalingState:
         elif state == ScaleUpExistingEngineState.SYNC_KV_CACHE_MEMORY_SIZE:
             if not self._sync_kv_cache_memory_size():
                 return False
+            if self._uses_precommit_graph_capture():
+                self.state = ScaleUpExistingEngineState.CAPTURE_NEW_RANKS
+            else:
+                self.state = ScaleUpExistingEngineState.COMMIT_SCALE_UP
+                self._mark_ready_for_switch()
+            return True
+
+        elif state == ScaleUpExistingEngineState.CAPTURE_NEW_RANKS:
+            if not self._execute_async(
+                "run_new_rank_capture_companion",
+                self._operation_id,
+            ):
+                return False
             self.state = ScaleUpExistingEngineState.COMMIT_SCALE_UP
             self._mark_ready_for_switch()
             return True
@@ -196,7 +212,22 @@ class ElasticEPScalingState:
         assert self.new_dp_group is not None and self.new_dp_store is not None
 
         if state == ScaleUpNewEngineState.PRE_KV_INIT:
-            self._collective_rpc("elastic_ep_execute", args=("prepare_new_worker",))
+            operation_ids = self._collective_rpc(
+                "elastic_ep_execute",
+                args=("prepare_new_worker", self.reconfig_request),
+            )
+            resolved_operation_ids = {
+                str(operation_id)
+                for operation_id in operation_ids
+                if operation_id
+            }
+            if len(resolved_operation_ids) > 1:
+                raise RuntimeError(
+                    "Workers resolved different external Elastic EP operation "
+                    f"IDs: {operation_ids}"
+                )
+            if resolved_operation_ids:
+                self._precommit_operation_id = resolved_operation_ids.pop()
             self.engine_core.available_gpu_memory_for_kv_cache = (
                 ParallelConfig.sync_kv_cache_memory_size(self.new_dp_group, -1)
             )
@@ -204,7 +235,15 @@ class ElasticEPScalingState:
             return True
 
         elif state == ScaleUpNewEngineState.PREPARE:
-            self._collective_rpc("elastic_ep_execute", args=("warmup_local_kernels",))
+            if self._uses_precommit_graph_capture():
+                self._collective_rpc(
+                    "elastic_ep_execute",
+                    args=("capture_new_rank_graphs", self._operation_id),
+                )
+            else:
+                self._collective_rpc(
+                    "elastic_ep_execute", args=("warmup_local_kernels",)
+                )
             self._mark_ready_for_switch()
             tensor = torch.tensor([0, 0, 0], dtype=torch.int32, device="cpu")
             torch.distributed.all_reduce(
@@ -271,6 +310,27 @@ class ElasticEPScalingState:
             self.state is ScaleUpExistingEngineState.COMMIT_SCALE_UP
             or self.state is ScaleDownRemainingEngineState.COMMIT_SCALE_DOWN
         )
+
+    @property
+    def _operation_id(self) -> str:
+        if self.reconfig_request is None:
+            return self._precommit_operation_id
+        return self.reconfig_request.operation_id
+
+    def _uses_precommit_graph_capture(self) -> bool:
+        if self._precommit_capture_enabled is None:
+            results = self._collective_rpc(
+                "elastic_ep_execute",
+                args=("supports_precommit_graph_capture", self._operation_id),
+            )
+            enabled_values = {bool(result) for result in results}
+            if len(enabled_values) != 1:
+                raise RuntimeError(
+                    "Workers disagreed on pre-commit graph capture support: "
+                    f"{results}"
+                )
+            self._precommit_capture_enabled = enabled_values.pop()
+        return self._precommit_capture_enabled
 
     @property
     def ready_key(self) -> str:

@@ -319,6 +319,10 @@ class ElasticEPScalingExecutor:
                 dp_group=standby_dp_group,
                 expert_weights=model.expert_weights,
             )
+        self._synchronize_weight_transfer()
+
+    def _synchronize_weight_transfer(self) -> None:
+        """Wait for weight P2P operations using platform semantics."""
         torch.accelerator.synchronize()
 
     def _warm_target_groups(self, dp_group, ep_group) -> None:
@@ -329,6 +333,16 @@ class ElasticEPScalingExecutor:
             for group in (dp_group, ep_group):
                 torch.distributed.all_reduce(tensor, group=group.device_group)
                 stream.synchronize()
+
+    def supports_precommit_graph_capture(self, operation_id: str) -> bool:
+        """Whether this worker prepared a platform fast-capture path."""
+        return False
+
+    def run_new_rank_capture_companion(self, operation_id: str) -> None:
+        """Match collectives issued while new ranks capture graphs."""
+
+    def capture_new_rank_graphs(self, operation_id: str) -> None:
+        """Platform hook for graph capture before the topology commit."""
 
     def broadcast_expert_mapping(self) -> None:
         standby_dp_group = get_standby_dp_group()
@@ -636,7 +650,12 @@ class ElasticEPScalingExecutor:
         }
         self._perform_eplb_reshuffle(rank_mapping=rank_mapping)
 
-    def prepare_new_worker(self) -> None:
+    def prepare_new_worker(
+        self,
+        reconfig_request: ReconfigureDistributedRequest | None = None,
+    ) -> str | None:
+        if reconfig_request is not None:
+            self.reconfig_request = reconfig_request
         dp_group = get_dp_group()
         assert isinstance(dp_group, StatelessGroupCoordinator)
         new_dp_size = dp_group.world_size
@@ -675,8 +694,9 @@ class ElasticEPScalingExecutor:
             dp_group=dp_group,
             expert_weights=expert_weights,
         )
-        torch.accelerator.synchronize()
+        self._synchronize_weight_transfer()
         self._warm_target_groups(get_dp_group(), get_ep_group())
+        return reconfig_request.operation_id if reconfig_request is not None else None
 
     def receive_expert_mapping(self) -> torch.Tensor:
         dp_group = get_dp_group()

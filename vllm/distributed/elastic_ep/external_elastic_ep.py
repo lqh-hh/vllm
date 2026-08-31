@@ -406,6 +406,7 @@ class ExternalElasticEPScaleCoordinator:
                 parallel_config._data_parallel_master_port_list.copy()
             ),
             coord_store_port=coord_store_port,
+            operation_id=epoch,
         )
 
         bootstrap_key = self.key(epoch, "bootstrap")
@@ -673,6 +674,7 @@ class ExternalElasticEPScaleCoordinator:
                         bootstrap.new_data_parallel_master_port_list
                     ),
                     coord_store_port=bootstrap.coord_store_port,
+                    operation_id=bootstrap.operation_id,
                 )
                 await self.client.call_utility_async(
                     "reinitialize_distributed", reconfig_request
@@ -756,6 +758,7 @@ class ExternalElasticEPScaleCoordinator:
                         bootstrap.new_data_parallel_master_port_list
                     ),
                     coord_store_port=bootstrap.coord_store_port,
+                    operation_id=bootstrap.operation_id,
                 )
                 await self.client.call_utility_async(
                     "reinitialize_distributed", reconfig_request

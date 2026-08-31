@@ -66,6 +66,7 @@ class WorkerSentinel:
                 f"(one of {sorted(FT_BACKEND_SET)}), but got '{all2all_backend}'."
             )
 
+    @torch.inference_mode()
     def handle_command(self, ft_request: FaultToleranceRequest):
         """Dispatch an FT command by instruction name."""
         with set_current_vllm_config(self.worker.vllm_config):
