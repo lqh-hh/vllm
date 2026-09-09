@@ -18,9 +18,47 @@ from vllm.v1.worker.gpu.cudagraph_utils import (
     CudaGraphManager,
 )
 
-_DP_SYNC_OVERRIDE: ContextVar[
-    tuple[ProcessGroup, Callable[[], None] | None] | None
-] = ContextVar("vllm_dp_sync_override", default=None)
+_DP_SYNC_OVERRIDE: ContextVar[tuple[ProcessGroup, Callable[[], None] | None] | None] = (
+    ContextVar("vllm_dp_sync_override", default=None)
+)
+
+# Shared CPU tensor layout: [entered_epoch, completed_epoch]. The executor
+# owns the storage so EngineCore can observe a Worker that is blocked in the
+# normal serving DP metadata collective without issuing another Worker RPC.
+_DP_COLLECTIVE_STATE: torch.Tensor | None = None
+
+
+def configure_dp_collective_state(state: torch.Tensor | None) -> None:
+    global _DP_COLLECTIVE_STATE
+    if state is None:
+        _DP_COLLECTIVE_STATE = None
+        return
+    if state.numel() != 2 or state.dtype != torch.int64 or state.device.type != "cpu":
+        raise ValueError("DP collective state must be a two-element CPU int64 tensor")
+    state.zero_()
+    _DP_COLLECTIVE_STATE = state
+
+
+def _enter_dp_metadata_collective() -> int | None:
+    state = _DP_COLLECTIVE_STATE
+    if state is None:
+        return None
+    epoch = int(state[0].item()) + 1
+    state[0] = epoch
+    return epoch
+
+
+def _complete_dp_metadata_collective(
+    epoch: int | None, synced_epoch: int | None = None
+) -> None:
+    if epoch is None:
+        return
+    state = _DP_COLLECTIVE_STATE
+    if state is None:
+        return
+    completed_epoch = epoch if synced_epoch is None else synced_epoch
+    state[0] = completed_epoch
+    state[1] = completed_epoch
 
 
 @contextmanager
@@ -65,14 +103,25 @@ def sync_cudagraph_and_dp_padding(
         before_all_reduce = None
     else:
         group, before_all_reduce = sync_override
-    tensor = torch.zeros(4, dp_size, dtype=torch.int32, device="cpu")
+    # Capture-only collectives use an override group and must not advance the
+    # serving epoch. Normal serving collectives carry the epoch as a fifth row
+    # so ranks introduced by a previous scale-up converge to the same value.
+    collective_epoch = (
+        _enter_dp_metadata_collective() if sync_override is None else None
+    )
+    metadata_rows = 5 if collective_epoch is not None else 4
+    tensor = torch.zeros(metadata_rows, dp_size, dtype=torch.int32, device="cpu")
     tensor[0][dp_rank] = num_tokens
     tensor[1][dp_rank] = desired_batch_desc.cg_mode.value
     tensor[2][dp_rank] = uniform_token_count or 0  # (0 means None)
     tensor[3][dp_rank] = max_query_len or -1  # (-1 means None)
+    if collective_epoch is not None:
+        tensor[4][dp_rank] = collective_epoch
     if before_all_reduce is not None:
         before_all_reduce()
     dist.all_reduce(tensor, group=group)
+    synced_epoch = int(tensor[4].max().item()) if collective_epoch is not None else None
+    _complete_dp_metadata_collective(collective_epoch, synced_epoch)
 
     if parallel_config.enable_fault_tolerance:
         if parallel_config.tensor_parallel_size > 1:

@@ -246,9 +246,22 @@ class ExternalElasticEPScaleCoordinator:
     ) -> int:
         parallel_config = self.client.vllm_config.parallel_config
         num_experts = self.client.vllm_config.model_config.get_num_experts()
-        num_redundant_experts = (
+        num_physical_experts = (
             num_experts + parallel_config.eplb_config.num_redundant_experts
-        ) * new_data_parallel_size // cur_data_parallel_size - num_experts
+        )
+        if num_physical_experts % cur_data_parallel_size != 0:
+            raise ValueError(
+                "Current EPLB physical expert capacity is not evenly divided "
+                "across the active DP ranks: "
+                f"physical_experts={num_physical_experts}, "
+                f"dp_size={cur_data_parallel_size}. "
+                "Synchronize the frontend EPLB config after fault recovery "
+                "before scaling Elastic EP."
+            )
+        num_local_physical_experts = num_physical_experts // cur_data_parallel_size
+        num_redundant_experts = (
+            num_local_physical_experts * new_data_parallel_size - num_experts
+        )
         if num_redundant_experts < 0:
             raise ValueError(
                 "Cannot scale external Elastic EP from DP size "
@@ -662,7 +675,12 @@ class ExternalElasticEPScaleCoordinator:
             if scale_up or dp_rank < bootstrap.new_data_parallel_size:
                 reconfig_request = ReconfigureDistributedRequest(
                     new_data_parallel_size=bootstrap.new_data_parallel_size,
-                    new_data_parallel_rank=ReconfigureRankType.KEEP_CURRENT_RANK,
+                    # FT scale-down can leave EngineCore temporarily using its
+                    # original sparse rank while the frontend has already
+                    # densified the serving topology. Send the frontend's
+                    # effective rank explicitly so the planned EEP transition
+                    # removes the hole before adding new ranks.
+                    new_data_parallel_rank=dp_rank,
                     new_data_parallel_rank_local=(
                         ReconfigureRankType.KEEP_CURRENT_RANK
                     ),

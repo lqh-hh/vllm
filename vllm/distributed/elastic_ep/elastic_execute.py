@@ -24,6 +24,7 @@ from vllm.distributed import (
     get_ep_group,
     get_pcp_group,
     get_tp_group,
+    get_world_group,
 )
 from vllm.distributed.elastic_ep.standby_state import (
     create_standby_groups,
@@ -56,6 +57,60 @@ logger = init_logger(__name__)
 if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
         FusedMoEMethodBase,
+    )
+
+
+def get_active_dp_size(dp_group: GroupCoordinator | None = None) -> int:
+    """Return the number of DP ranks currently participating in serving.
+
+    Fault-tolerance scale-down keeps the original model-side group width so
+    captured MC2/V3 tensor addresses remain valid. Dead ranks are recorded on
+    that group instead, so ``world_size`` alone is not the active topology size
+    seen by a following planned Elastic EP operation.
+    """
+    if dp_group is None:
+        dp_group = get_dp_group()
+    dead_dp_ranks = set(getattr(dp_group, "dead_dp_ranks", ()))
+    invalid_dead_ranks = {
+        rank for rank in dead_dp_ranks if rank < 0 or rank >= dp_group.world_size
+    }
+    if invalid_dead_ranks:
+        raise RuntimeError(
+            "Elastic EP found invalid dead DP ranks: "
+            f"dead_dp_ranks={sorted(dead_dp_ranks)}, "
+            f"world_size={dp_group.world_size}"
+        )
+    active_dp_size = dp_group.world_size - len(dead_dp_ranks)
+    if active_dp_size <= 0:
+        raise RuntimeError(
+            "Elastic EP requires at least one active DP rank: "
+            f"dead_dp_ranks={sorted(dead_dp_ranks)}, "
+            f"world_size={dp_group.world_size}"
+        )
+    return active_dp_size
+
+
+def compact_active_expert_tensor(
+    tensor: torch.Tensor, dp_group: GroupCoordinator
+) -> torch.Tensor:
+    """Remove dead DP chunks from the final physical-expert dimension."""
+    active_dp_size = get_active_dp_size(dp_group)
+    if active_dp_size == dp_group.world_size:
+        return tensor
+    if tensor.shape[-1] % dp_group.world_size:
+        raise ValueError(
+            "Physical expert capacity is not divisible by the preserved DP size: "
+            f"shape={tuple(tensor.shape)}, dp_size={dp_group.world_size}"
+        )
+    experts_per_dp = tensor.shape[-1] // dp_group.world_size
+    dead_dp_ranks = set(dp_group.dead_dp_ranks)
+    return torch.cat(
+        [
+            tensor[..., rank * experts_per_dp : (rank + 1) * experts_per_dp]
+            for rank in range(dp_group.world_size)
+            if rank not in dead_dp_ranks
+        ],
+        dim=-1,
     )
 
 
@@ -158,6 +213,7 @@ class ElasticEPScalingExecutor:
         )
         self._async_future: Future[None] | None = None
         self._group_cleanup_future: Future[None] | None = None
+        self._target_global_rank: int | None = None
 
     @property
     def worker(self):
@@ -248,10 +304,42 @@ class ElasticEPScalingExecutor:
         self._wait_for_group_cleanup()
         self.reconfig_request = reconfig_request
         new_dp_size = reconfig_request.new_data_parallel_size
-        old_dp_size = get_dp_group().world_size
+        active_dp_group = get_dp_group()
+        old_dp_size = get_active_dp_size(active_dp_group)
+        if old_dp_size != active_dp_group.world_size:
+            logger.info(
+                "[Elastic EP] Using %d active DP ranks from preserved "
+                "model-side group width %d; dead_dp_ranks=%s",
+                old_dp_size,
+                active_dp_group.world_size,
+                sorted(active_dp_group.dead_dp_ranks),
+            )
         parallel_config = self.worker.vllm_config.parallel_config
         world_size = parallel_config.world_size
         new_world_size_across_dp = world_size * new_dp_size
+        requested_dp_rank = reconfig_request.new_data_parallel_rank
+        target_dp_rank = (
+            parallel_config.data_parallel_rank
+            if requested_dp_rank == ReconfigureRankType.KEEP_CURRENT_RANK
+            else int(requested_dp_rank)
+        )
+        if not 0 <= target_dp_rank < new_dp_size:
+            raise ValueError(
+                "Invalid target DP rank for Elastic EP standby groups: "
+                f"rank={target_dp_rank}, size={new_dp_size}"
+            )
+        active_world = get_world_group()
+        model_parallel_rank = active_world.rank % world_size
+        new_global_rank = target_dp_rank * world_size + model_parallel_rank
+        self._target_global_rank = new_global_rank
+        logger.info(
+            "[Elastic EP] Creating standby groups with target global rank "
+            "%d/%d (active global rank %d/%d)",
+            new_global_rank,
+            new_world_size_across_dp,
+            active_world.rank,
+            active_world.world_size,
+        )
         create_standby_groups(
             new_dp_size=new_dp_size,
             new_world_size_across_dp=new_world_size_across_dp,
@@ -259,6 +347,7 @@ class ElasticEPScalingExecutor:
             coord_store_port=reconfig_request.coord_store_port,
             use_all2all=use_all2all,
             enable_eplb=parallel_config.enable_eplb,
+            new_global_rank=new_global_rank,
         )
         self.stage_standby_moe_quant_methods()
         self._prepare_eplb_communicator(get_standby_eplb_group())
@@ -290,7 +379,10 @@ class ElasticEPScalingExecutor:
         )
 
         num_new_workers = new_dp_size - old_dp_size
-        dp_rank = self.worker.vllm_config.parallel_config.data_parallel_rank
+        # Use the rank in the target topology. After fault-tolerance shrink the
+        # Worker config intentionally retains its original physical DP rank,
+        # which can differ from the dense rank assigned to the standby group.
+        dp_rank = standby_dp_group.rank_in_group
 
         # Sender-receiver pairing: the first new_workers % old_dp_size
         # senders get (k+1) contiguous receivers, the rest get k
@@ -356,6 +448,9 @@ class ElasticEPScalingExecutor:
         num_physical_experts = physical_to_logical.shape[1]
         num_local_physical_experts = num_physical_experts // get_ep_group().world_size
         num_logical_experts = eplb_model_state.logical_replica_count.shape[1]
+        physical_to_logical = compact_active_expert_tensor(
+            physical_to_logical, get_dp_group()
+        )
         broadcast_expert_mapping(
             physical_to_logical=physical_to_logical,
             num_local_physical_experts=num_local_physical_experts,
@@ -441,8 +536,9 @@ class ElasticEPScalingExecutor:
         self._wait_for_group_cleanup()
 
     def switch_and_prepare(self) -> tuple[GroupCoordinator | None, ...]:
-        old_dp_size = get_dp_group().world_size
-        old_ep_size = get_ep_group().world_size
+        old_dp_group = get_dp_group()
+        old_dp_size = get_active_dp_size(old_dp_group)
+        old_ep_size = get_ep_group().world_size // old_dp_group.world_size * old_dp_size
 
         self._release_cuda_graphs()
         retired_groups = _replace_active_groups(**pop_standby_groups())
@@ -496,6 +592,22 @@ class ElasticEPScalingExecutor:
         model_config = self.worker.model_runner.model_config
         eplb_model_state = eplb_state.model_states[model_config.compute_hash()]
 
+        if old_dp_size != old_dp_group.world_size:
+            # FT leaves holes at the original rank positions. The standby
+            # groups use dense survivor ranks, so align maps and load history.
+            for name in (
+                "physical_to_logical_map",
+                "expert_load_pass",
+                "expert_load_window",
+            ):
+                setattr(
+                    eplb_model_state,
+                    name,
+                    compact_active_expert_tensor(
+                        getattr(eplb_model_state, name), old_dp_group
+                    ),
+                )
+
         num_physical_experts = num_local_experts * new_ep_size
         num_logical_experts = eplb_model_state.logical_replica_count.shape[1]
         parallel_config.eplb_config.num_redundant_experts = (
@@ -536,6 +648,12 @@ class ElasticEPScalingExecutor:
             eplb_model_state.expert_load_window = eplb_model_state.expert_load_window[
                 :, :, :num_physical_experts
             ]
+
+        if old_dp_size != old_dp_group.world_size:
+            # Rebuild inverse maps before layers cache their routing tables.
+            eplb_state.update_mapping(
+                model_config, eplb_model_state.physical_to_logical_map
+            )
 
         model = self.worker.model_runner.get_model()
         model.expert_weights = []
@@ -626,6 +744,8 @@ class ElasticEPScalingExecutor:
         self._perform_eplb_reshuffle(async_op=True)
         if is_existing_worker:
             self._start_group_cleanup(retired_groups)
+        # FT survivors must resume the same EPLB collectives as new workers.
+        self.worker.model_runner.eep_eplb_suppressed = False
 
     def commit_scale_down(self, new_dp_size: int, removing: bool) -> None:
         self.perform_scale_down_eplb_reshuffle(new_dp_size)

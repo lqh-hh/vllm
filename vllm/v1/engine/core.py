@@ -97,6 +97,7 @@ logger = init_logger(__name__)
 
 
 HANDSHAKE_TIMEOUT_MINS = 5
+DP_STATE_SYNC_INTERVAL = 32
 
 _R = TypeVar("_R")  # Return type for collective_rpc
 
@@ -587,6 +588,9 @@ class EngineCore:
         was executed.
         """
 
+        if getattr(self, "_eep_drain_batch_queue", False):
+            return {}, False
+
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
@@ -646,9 +650,10 @@ class EngineCore:
         # Note that this is not blocking.
         assert len(batch_queue) < self.batch_queue_size
 
+        drain_batch_queue = getattr(self, "_eep_drain_batch_queue", False)
         model_executed = False
         deferred_scheduler_output = None
-        if self.scheduler.has_requests():
+        if self.scheduler.has_requests() and not drain_batch_queue:
             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
@@ -1081,6 +1086,17 @@ class EngineCoreProc(EngineCore):
             # Initialize fault tolerance settings.
             self.enable_fault_tolerance = (
                 vllm_config.parallel_config.enable_fault_tolerance
+            )
+            ft_config = vllm_config.parallel_config.fault_tolerance_config
+            logger.info(
+                "[FT_DIAG] EngineCore initialized: engine_index=%s, "
+                "dp_rank=%s, enable_fault_tolerance=%s, auto_recovery=%s, "
+                "engine_recovery_timeout_sec=%s",
+                self.engine_index,
+                vllm_config.parallel_config.data_parallel_rank,
+                self.enable_fault_tolerance,
+                ft_config.auto_recovery,
+                ft_config.engine_recovery_timeout_sec,
             )
             if self.enable_fault_tolerance:
                 # FT sentinel requires DP-specific state (e.g. dp_store).
@@ -2052,6 +2068,9 @@ class DPEngineCoreProc(EngineCoreProc):
         from vllm.distributed.elastic_ep.elastic_state import ElasticEPScalingState
 
         self.eep_scaling_state: ElasticEPScalingState | None = None
+        self._eep_drain_batch_queue = False
+        self._eep_force_dummy_batch = False
+        self._eep_scale_up_interruption_state: ElasticEPScalingState | None = None
 
         # Initialize the engine.
         dp_rank = vllm_config.parallel_config.data_parallel_rank
@@ -2125,29 +2144,50 @@ class DPEngineCoreProc(EngineCoreProc):
                 )
 
     def resume_scheduler(self):
-        if self.pending_pause or (self.engines_running and self.ignore_start_dp_wave):
-            raise RuntimeError(
-                "resume_scheduler called while pause is still in "
-                "flight. Wait for the pause future to resolve before "
-                "resuming."
-            )
-        if self.engines_running:
-            logger.debug("Resume called while engines are not paused, ignoring.")
-            return
-
-        super().resume_scheduler()
-        self.ignore_start_dp_wave = False
-
-        # Barrier: wait for all DP ranks to have resumed (and cleared
-        # ignore_start_dp_wave) before any rank starts stepping. Uses
-        # the existing all-reduce which is safe because engines are
-        # stopped.
-        has_global_unfinished = ParallelConfig.has_unfinished_dp(
-            self.dp_group, self.scheduler.has_unfinished_requests()
+        interruption_state = getattr(
+            self,
+            "_eep_scale_up_interruption_state",
+            None,
         )
+        resume_timing = None
+        try:
+            if self.pending_pause or (
+                self.engines_running and self.ignore_start_dp_wave
+            ):
+                raise RuntimeError(
+                    "resume_scheduler called while pause is still in "
+                    "flight. Wait for the pause future to resolve before "
+                    "resuming."
+                )
+            if self.engines_running:
+                logger.debug("Resume called while engines are not paused, ignoring.")
+                return
 
-        if has_global_unfinished:
-            self.engines_running = True
+            if interruption_state is not None:
+                resume_timing = interruption_state.begin_scale_up_scheduler_resume()
+
+            super().resume_scheduler()
+            self.ignore_start_dp_wave = False
+
+            # Barrier: wait for all DP ranks to have resumed (and cleared
+            # ignore_start_dp_wave) before any rank starts stepping. Uses
+            # the existing all-reduce which is safe because engines are
+            # stopped.
+            has_global_unfinished = ParallelConfig.has_unfinished_dp(
+                self.dp_group, self.scheduler.has_unfinished_requests()
+            )
+
+            if has_global_unfinished:
+                self.engines_running = True
+        except BaseException:
+            if interruption_state is not None:
+                interruption_state.finish_scale_up_scheduler_resume(
+                    resume_timing,
+                    result="error",
+                )
+            raise
+        if interruption_state is not None:
+            interruption_state.finish_scale_up_scheduler_resume(resume_timing)
 
     def barrier(self):
         """Blocking barrier on the DP process group (test-only utility)."""
@@ -2230,6 +2270,7 @@ class DPEngineCoreProc(EngineCoreProc):
                     self.process_input_queue_block = True
                     self.eep_scaling_state = None
                 elif not state.commit_requested and state.is_ready_for_switch():
+                    state.start_scale_up_inference_interruption()
                     self.process_input_queue_block = True
 
             executed = self._process_engine_step()
@@ -2241,9 +2282,14 @@ class DPEngineCoreProc(EngineCoreProc):
                     # All engines are idle.
                     continue
 
+                skip_dummy_batch = (
+                    self.eep_scaling_state is not None
+                    and self.eep_scaling_state.should_skip_dummy_batch()
+                )
                 # Execute a dummy pass when no ready requests ran, unless the
-                # engine is sleeping.
-                elif not self.model_executor.is_sleeping:
+                # engine is sleeping or the Elastic EP drain is waiting for
+                # queued work/peer epoch publication.
+                if not skip_dummy_batch and not self.model_executor.is_sleeping:
                     with self.capture_iteration_details(None) as iteration_details:
                         self.execute_dummy_batch()
                     if iteration_details is not None and not self.has_coordinator:
@@ -2293,9 +2339,18 @@ class DPEngineCoreProc(EngineCoreProc):
         raise SystemExit
 
     def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
-        # Optimization - only perform finish-sync all-reduce every 32 steps.
+        if (
+            self.eep_scaling_state is not None
+            and self.eep_scaling_state.should_defer_dp_state_sync()
+        ):
+            # Preparation keeps serving through Worker-level metadata
+            # collectives. Avoid crossing any of them with the regular
+            # EngineCore DP-state all-reduce until PREPARE has finished.
+            return True
+
+        # Optimization - only perform finish-sync all-reduce periodically.
         self.step_counter += 1
-        if self.step_counter % 32 != 0:
+        if self.step_counter % DP_STATE_SYNC_INTERVAL != 0:
             return True
 
         has_unfinished, pause_consensus = ParallelConfig.sync_dp_state(
