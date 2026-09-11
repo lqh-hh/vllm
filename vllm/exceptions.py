@@ -3,6 +3,7 @@
 
 """Custom exceptions for vLLM."""
 
+from http import HTTPStatus
 from typing import Any
 
 
@@ -116,3 +117,23 @@ class VLLMUnprocessableEntityError(VLLMClientError):
         if self.value is not None:
             extras.append(f"value={self.value}")
         return f"{base} ({', '.join(extras)})" if extras else base
+
+
+class GracefulHTTPError(VLLMError):
+    """An expected rejection carrying its HTTP response status."""
+
+    def __init__(self, message: str, http_status: HTTPStatus):
+        super().__init__(message)
+        self.message = message
+        self.http_status = http_status
+
+
+class EngineFaultedError(GracefulHTTPError):
+    """Reject admission while the engine awaits fault recovery."""
+
+    def __init__(self):
+        super().__init__(
+            "The engine has faulted and cannot accept new requests. "
+            "Please try again later or on a different instance.",
+            HTTPStatus.SERVICE_UNAVAILABLE,
+        )

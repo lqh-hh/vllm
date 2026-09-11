@@ -21,7 +21,12 @@ from vllm.distributed.weight_transfer.base import (
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.protocol import EngineClient, StreamingInput
 from vllm.entrypoints.serve.elastic_ep.middleware import set_scaling_elastic_ep
-from vllm.exceptions import VLLMClientError, VLLMValidationError
+from vllm.exceptions import (
+    EngineFaultedError,
+    GracefulHTTPError,
+    VLLMClientError,
+    VLLMValidationError,
+)
 from vllm.inputs import EngineInput, PromptType
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
@@ -273,6 +278,19 @@ class AsyncLLM(EngineClient):
         if handler is not None:
             cancel_task_threadsafe(handler)
 
+    def check_admission(self, request_id: str | None = None) -> None:
+        """Reject new requests until the local engine completes FT recovery."""
+        if (
+            self.vllm_config.parallel_config.enable_fault_tolerance
+            and self.engine_core.engine_status.get("status") != "healthy"
+        ):
+            logger.info(
+                "Engine %s - rejecting request %s.",
+                self.engine_core.engine_status.get("status"),
+                request_id,
+            )
+            raise EngineFaultedError()
+
     async def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         if not hasattr(self, "_supported_tasks"):
             # Cache the result
@@ -303,6 +321,8 @@ class AsyncLLM(EngineClient):
 
         if self.errored:
             raise EngineDeadError()
+
+        self.check_admission(request_id)
 
         is_pooling = isinstance(params, PoolingParams)
 
@@ -631,7 +651,7 @@ class AsyncLLM(EngineClient):
             raise
 
         # Request validation error.
-        except VLLMClientError as e:
+        except (VLLMClientError, GracefulHTTPError) as e:
             if self.log_requests:
                 logger.info("Request %s failed (bad request): %s.", request_id, e)
             raise
@@ -908,7 +928,7 @@ class AsyncLLM(EngineClient):
             raise
 
         # Request validation error.
-        except VLLMClientError:
+        except (VLLMClientError, GracefulHTTPError):
             if self.log_requests:
                 logger.info("Request %s failed (bad request).", request_id)
             raise
