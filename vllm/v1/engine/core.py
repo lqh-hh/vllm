@@ -98,6 +98,7 @@ logger = init_logger(__name__)
 
 
 HANDSHAKE_TIMEOUT_MINS = 5
+DP_STATE_SYNC_INTERVAL = 32
 
 _R = TypeVar("_R")  # Return type for collective_rpc
 
@@ -601,6 +602,9 @@ class EngineCore:
         was executed.
         """
 
+        if getattr(self, "_eep_drain_batch_queue", False):
+            return {}, False
+
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
@@ -660,9 +664,10 @@ class EngineCore:
         # Note that this is not blocking.
         assert len(batch_queue) < self.batch_queue_size
 
+        drain_batch_queue = getattr(self, "_eep_drain_batch_queue", False)
         model_executed = False
         deferred_scheduler_output = None
-        if self.scheduler.has_requests():
+        if self.scheduler.has_requests() and not drain_batch_queue:
             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
@@ -1104,6 +1109,16 @@ class EngineCoreProc(EngineCore):
             self.enable_fault_tolerance = (
                 vllm_config.parallel_config.enable_fault_tolerance
             )
+            ft_config = vllm_config.parallel_config.fault_tolerance_config
+            logger.info(
+                "[FT_DIAG] EngineCore initialized: engine_index=%s, "
+                "dp_rank=%s, enable_fault_tolerance=%s, "
+                "engine_recovery_timeout_sec=%s",
+                self.engine_index,
+                vllm_config.parallel_config.data_parallel_rank,
+                self.enable_fault_tolerance,
+                ft_config.engine_recovery_timeout_sec,
+            )
             if self.enable_fault_tolerance:
                 self.ft_sentinel = EngineCoreSentinel(
                     engine=self,
@@ -1248,6 +1263,13 @@ class EngineCoreProc(EngineCore):
                 ready_msg["parallel_config_hash"] = (
                     vllm_config.parallel_config.compute_hash()
                 )
+            if vllm_config.parallel_config.enable_elastic_ep:
+                ready_msg["coord_store_port"] = (
+                    vllm_config.parallel_config._coord_store_port
+                )
+                ready_msg["num_redundant_experts"] = (
+                    vllm_config.parallel_config.eplb_config.num_redundant_experts
+                )
 
             handshake_socket.send(msgspec.msgpack.encode(ready_msg))
 
@@ -1278,14 +1300,34 @@ class EngineCoreProc(EngineCore):
                 f"minutes"
             )
         init_bytes = handshake_socket.recv()
-        init_message: EngineHandshakeMetadata = msgspec.msgpack.decode(
-            init_bytes, type=EngineHandshakeMetadata
-        )
+        num_redundant_experts: int | None = None
+        if (
+            envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH
+            and parallel_config is not None
+            and parallel_config.data_parallel_external_lb
+        ):
+            from vllm.distributed.elastic_ep.external_elastic_ep import (
+                ExternalElasticEPScaleUpHandshakeMetadata,
+            )
+
+            scale_up_message = msgspec.msgpack.decode(
+                init_bytes, type=ExternalElasticEPScaleUpHandshakeMetadata
+            )
+            init_message = scale_up_message.engine_metadata
+            num_redundant_experts = scale_up_message.num_redundant_experts
+        else:
+            init_message = msgspec.msgpack.decode(
+                init_bytes, type=EngineHandshakeMetadata
+            )
         logger.debug("Received init message: %s", init_message)
 
         if parallel_config is not None:
             for key, value in init_message.parallel_config.items():
                 setattr(parallel_config, key, value)
+            if num_redundant_experts is not None:
+                parallel_config.eplb_config.num_redundant_experts = (
+                    num_redundant_experts
+                )
 
         return init_message.addresses
 
@@ -1681,6 +1723,9 @@ class EngineCoreProc(EngineCore):
                 if self.vllm_config.lora_config is not None
                 else 0
             ),
+            coord_store_port=parallel_config._coord_store_port,
+            coordinator_input_address=self.addresses.coordinator_input,
+            coordinator_output_address=self.addresses.coordinator_output,
             kv_events_config=self.scheduler.get_kv_event_publisher_config(),
             weight_transfer_backend=(
                 self.vllm_config.weight_transfer_config.backend
@@ -2040,6 +2085,8 @@ class DPEngineCoreProc(EngineCoreProc):
         from vllm.distributed.elastic_ep.elastic_state import ElasticEPScalingState
 
         self.eep_scaling_state: ElasticEPScalingState | None = None
+        self._eep_drain_batch_queue = False
+        self._eep_force_dummy_batch = False
 
         # Initialize the engine.
         dp_rank = vllm_config.parallel_config.data_parallel_rank
@@ -2212,6 +2259,13 @@ class DPEngineCoreProc(EngineCoreProc):
                 if state.is_complete():
                     if state.worker_type == "removing":
                         raise SystemExit
+                    if (
+                        state.worker_type == "new"
+                        and self.vllm_config.parallel_config.data_parallel_external_lb
+                    ):
+                        # An independently launched rank has no external utility
+                        # caller to join the post-commit resume barrier.
+                        self.resume_scheduler()
                     self.process_input_queue_block = True
                     self.eep_scaling_state = None
                 elif not state.commit_requested and state.is_ready_for_switch():
@@ -2226,9 +2280,14 @@ class DPEngineCoreProc(EngineCoreProc):
                     # All engines are idle.
                     continue
 
+                skip_dummy_batch = (
+                    self.eep_scaling_state is not None
+                    and self.eep_scaling_state.should_skip_dummy_batch()
+                )
                 # Execute a dummy pass when no ready requests ran, unless the
-                # engine is sleeping.
-                elif not self.model_executor.is_sleeping:
+                # engine is sleeping or the Elastic EP drain is waiting for
+                # queued work/peer epoch publication.
+                if not skip_dummy_batch and not self.model_executor.is_sleeping:
                     with self.capture_iteration_details(None) as iteration_details:
                         self.execute_dummy_batch()
                     if iteration_details is not None and not self.has_coordinator:
@@ -2278,9 +2337,18 @@ class DPEngineCoreProc(EngineCoreProc):
         raise SystemExit
 
     def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
-        # Optimization - only perform finish-sync all-reduce every 32 steps.
+        if (
+            self.eep_scaling_state is not None
+            and self.eep_scaling_state.should_defer_dp_state_sync()
+        ):
+            # Preparation keeps serving through Worker-level metadata
+            # collectives. Avoid crossing any of them with the regular
+            # EngineCore DP-state all-reduce until PREPARE has finished.
+            return True
+
+        # Optimization - only perform finish-sync all-reduce periodically.
         self.step_counter += 1
-        if self.step_counter % 32 != 0:
+        if self.step_counter % DP_STATE_SYNC_INTERVAL != 0:
             return True
 
         has_unfinished, pause_consensus = ParallelConfig.sync_dp_state(
@@ -2389,12 +2457,10 @@ class DPEngineCoreProc(EngineCoreProc):
             self.output_queue.put_nowait((0, outputs))
         else:
             encoder = MsgpackEncoder()
-            with (
-                zmq.Context() as ctx,
-                make_zmq_socket(
-                    ctx, self.addresses.outputs[0], zmq.PUSH, linger=4000
-                ) as socket,
-            ):
+            ctx = zmq.Context.instance()
+            with make_zmq_socket(
+                ctx, self.addresses.outputs[0], zmq.PUSH, linger=4000
+            ) as socket:
                 socket.send_multipart(encoder.encode(outputs))
 
     def _eep_scale_up_before_kv_init(self):

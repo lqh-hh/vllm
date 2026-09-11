@@ -73,6 +73,7 @@ class WorkerSentinel:
         if worker.parallel_config.prefill_context_parallel_size > 1:
             raise ValueError("Fault tolerance does not support PCP yet.")
 
+    @torch.inference_mode()
     def handle_command(self, ft_request: FaultToleranceRequest):
         """Dispatch an FT command by instruction name."""
         with set_current_vllm_config(self.worker.vllm_config):

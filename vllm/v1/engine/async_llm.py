@@ -20,7 +20,11 @@ from vllm.distributed.weight_transfer.base import (
 )
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.protocol import EngineClient, StreamingInput
-from vllm.entrypoints.serve.elastic_ep.middleware import set_scaling_elastic_ep
+from vllm.entrypoints.serve.elastic_ep.middleware import (
+    get_elastic_ep_rank_retired,
+    set_elastic_ep_rank_retired,
+    set_scaling_elastic_ep,
+)
 from vllm.exceptions import (
     EngineFaultedError,
     GracefulHTTPError,
@@ -116,6 +120,13 @@ class AsyncLLM(EngineClient):
 
         self.vllm_config = vllm_config
         self._elastic_ep_lock = asyncio.Lock()
+        parallel_config = vllm_config.parallel_config
+        # Fault-tolerance scale-down keeps original rank coordinates inside
+        # EngineCore until the next Elastic EP reconfiguration. Track that
+        # mapping in the frontend so repeated FT scale-downs can still expose
+        # the dense, currently serving topology to the Elastic EP API.
+        self._ft_original_dp_rank = parallel_config.data_parallel_rank
+        self._ft_active_dp_ranks = list(range(parallel_config.data_parallel_size))
         self.model_config = vllm_config.model_config
         self.observability_config = vllm_config.observability_config
 
@@ -172,8 +183,6 @@ class AsyncLLM(EngineClient):
                 aggregate_engine_logging=aggregate_engine_logging,
             )
             self.logger_manager.log_engine_initialized()
-
-        self._client_count = client_count
 
         self.output_handler: asyncio.Task | None = None
         try:
@@ -762,6 +771,12 @@ class AsyncLLM(EngineClient):
                             mm_cache_stats=renderer.stat_mm_cache(),
                         )
             except Exception as e:
+                if get_elastic_ep_rank_retired() and isinstance(e, EngineDeadError):
+                    logger.info(
+                        "[Elastic EP] Retired rank stopped receiving EngineCore outputs"
+                    )
+                    output_processor.propagate_error(e)
+                    return
                 logger.exception("AsyncLLM output_handler failed.")
                 output_processor.propagate_error(e)
 
@@ -960,6 +975,8 @@ class AsyncLLM(EngineClient):
 
     async def check_health(self) -> None:
         logger.debug("Called check_health.")
+        if get_elastic_ep_rank_retired():
+            return
         if self.errored:
             raise self.dead_error
 
@@ -1079,7 +1096,8 @@ class AsyncLLM(EngineClient):
     async def _scale_elastic_ep(
         self, new_data_parallel_size: int, drain_timeout: int
     ) -> None:
-        old_data_parallel_size = self.vllm_config.parallel_config.data_parallel_size
+        parallel_config = self.vllm_config.parallel_config
+        old_data_parallel_size = parallel_config.data_parallel_size
         if old_data_parallel_size == new_data_parallel_size:
             logger.info(
                 "Data parallel size is already %s, skipping scale",
@@ -1110,15 +1128,111 @@ class AsyncLLM(EngineClient):
         if envs.VLLM_ELASTIC_EP_DRAIN_REQUESTS:
             await self._drain_requests_for_elastic_ep(drain_timeout)
 
-        await self.engine_core.commit_elastic_ep()
-        self.vllm_config.parallel_config.data_parallel_size = new_data_parallel_size
-        set_scaling_elastic_ep(False)
+        rank_will_retire = (
+            parallel_config.data_parallel_external_lb
+            and new_data_parallel_size < old_data_parallel_size
+            and parallel_config.data_parallel_rank >= new_data_parallel_size
+        )
+        if rank_will_retire:
+            set_elastic_ep_rank_retired(True)
+
+        commit_succeeded = False
+        try:
+            await self.engine_core.commit_elastic_ep()
+            parallel_config.data_parallel_size = new_data_parallel_size
+            # A planned Elastic EP transition installs a new dense topology,
+            # so it becomes the baseline for any later FT scale-down.
+            self._ft_original_dp_rank = parallel_config.data_parallel_rank
+            self._ft_active_dp_ranks = list(range(new_data_parallel_size))
+            commit_succeeded = True
+            if rank_will_retire:
+                logger.info(
+                    "[Elastic EP] Data-parallel rank %s is retired and awaiting "
+                    "external process shutdown",
+                    parallel_config.data_parallel_rank,
+                )
+        finally:
+            if rank_will_retire and not commit_succeeded:
+                set_elastic_ep_rank_retired(False)
+            set_scaling_elastic_ep(False)
+
+    async def get_external_elastic_ep_phase(self) -> str | None:
+        return await self.engine_core.get_external_elastic_ep_phase()
 
     async def handle_fault(
         self, fault_tolerance_request: FaultToleranceRequest
     ) -> FaultToleranceResult:
         """send fault tolerance instruction to the engine"""
-        return await self.engine_core.handle_fault(fault_tolerance_request)
+        result = await self.engine_core.handle_fault(fault_tolerance_request)
+        if result.success and fault_tolerance_request.instruction == "scale_down":
+            parallel_config = self.vllm_config.parallel_config
+            old_dp_size = parallel_config.data_parallel_size
+            old_dp_rank = parallel_config.data_parallel_rank
+            old_num_redundant_experts: int | None = None
+            removed_dp_ranks = set(fault_tolerance_request.params["removed_dp_ranks"])
+            active_dp_ranks = [
+                rank
+                for rank in self._ft_active_dp_ranks
+                if rank not in removed_dp_ranks
+            ]
+            if self._ft_original_dp_rank not in active_dp_ranks:
+                raise RuntimeError(
+                    "A successful fault-tolerance scale-down removed the "
+                    "current frontend rank."
+                )
+
+            if getattr(parallel_config, "enable_eplb", False):
+                num_experts = self.model_config.get_num_experts()
+                if num_experts is not None:
+                    old_num_redundant_experts = (
+                        parallel_config.eplb_config.num_redundant_experts
+                    )
+                    num_physical_experts = num_experts + old_num_redundant_experts
+                    if num_physical_experts % old_dp_size != 0:
+                        raise RuntimeError(
+                            "The frontend EPLB capacity is inconsistent with "
+                            "the pre-fault DP topology: "
+                            f"physical_experts={num_physical_experts}, "
+                            f"dp_size={old_dp_size}"
+                        )
+                    num_local_physical_experts = num_physical_experts // old_dp_size
+                    new_num_redundant_experts = (
+                        num_local_physical_experts * len(active_dp_ranks) - num_experts
+                    )
+                    if new_num_redundant_experts < 0:
+                        raise RuntimeError(
+                            "Fault-tolerance scale-down left fewer physical "
+                            "experts than the model requires: "
+                            "physical_experts="
+                            f"{num_local_physical_experts * len(active_dp_ranks)}, "
+                            f"logical_experts={num_experts}"
+                        )
+                    parallel_config.eplb_config.num_redundant_experts = (
+                        new_num_redundant_experts
+                    )
+
+            parallel_config.data_parallel_size = len(active_dp_ranks)
+            parallel_config.data_parallel_rank = active_dp_ranks.index(
+                self._ft_original_dp_rank
+            )
+            self._ft_active_dp_ranks = active_dp_ranks
+            logger.info(
+                "[FT] Synchronized frontend DP config after scale_down: "
+                "dp_size %d->%d, dp_rank %d->%d, "
+                "redundant_experts %s->%s, removed %s",
+                old_dp_size,
+                parallel_config.data_parallel_size,
+                old_dp_rank,
+                parallel_config.data_parallel_rank,
+                old_num_redundant_experts,
+                (
+                    parallel_config.eplb_config.num_redundant_experts
+                    if old_num_redundant_experts is not None
+                    else None
+                ),
+                sorted(removed_dp_ranks),
+            )
+        return result
 
     async def get_status(self):
         return await self.engine_core.get_status()
@@ -1135,6 +1249,10 @@ class AsyncLLM(EngineClient):
     @property
     def errored(self) -> bool:
         return self.engine_core.resources.engine_dead or not self.is_running
+
+    @property
+    def should_keep_api_server_alive(self) -> bool:
+        return get_elastic_ep_rank_retired()
 
     @property
     def dead_error(self) -> BaseException:
