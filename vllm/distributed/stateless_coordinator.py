@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import json
 import socket
-import struct
 from typing import Any, Optional
 
 import torch
@@ -22,10 +22,9 @@ from vllm.distributed.utils import (
 )
 from vllm.logger import init_logger
 from vllm.utils.import_utils import resolve_obj_by_qualname
+from vllm.utils.network_utils import get_ip
 
 logger = init_logger(__name__)
-
-_PORTS_FMT = "!3I"
 
 
 def _allocate_group_ports(
@@ -33,29 +32,36 @@ def _allocate_group_ports(
     host: str,
     coord_store: Store,
 ) -> tuple[list[int], list[socket.socket]]:
-    """Bind 3 sockets and publish the ports to *coord_store*.
+    """Bind 3 sockets and publish their host and ports to *coord_store*.
 
     Called by rank 0 only.  Returns ``(ports, sockets)`` with the
     sockets still open.
     """
     socks: list[socket.socket] = []
     ports: list[int] = []
-    for _ in range(3):
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.bind((host, 0))
-        s.listen()
-        socks.append(s)
-        ports.append(s.getsockname()[1])
-    coord_store.set(key, struct.pack(_PORTS_FMT, *ports))
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    try:
+        for _ in range(3):
+            s = socket.socket(family, socket.SOCK_STREAM)
+            socks.append(s)
+            s.bind((host, 0))
+            s.listen()
+            ports.append(s.getsockname()[1])
+        coord_store.set(key, json.dumps({"host": host, "ports": ports}).encode())
+    except Exception:
+        for s in socks:
+            s.close()
+        raise
     return ports, socks
 
 
-def _fetch_group_ports(key: str, coord_store: Store) -> list[int]:
-    """Read 3 ports published by rank 0 from *coord_store*.
+def _fetch_group_ports(key: str, coord_store: Store) -> tuple[str, list[int]]:
+    """Read the host and 3 ports published by group rank 0.
 
     Blocks until the key is available.
     """
-    return list(struct.unpack(_PORTS_FMT, coord_store.get(key)))
+    endpoint = json.loads(coord_store.get(key))
+    return endpoint["host"], endpoint["ports"]
 
 
 class StatelessGroupCoordinator(GroupCoordinator):
@@ -113,18 +119,26 @@ class StatelessGroupCoordinator(GroupCoordinator):
 
                 key = f"{group_name}_{idx}"
                 if self.rank_in_group == 0:
+                    # Rank ordering can place the group leader on a different
+                    # node from the coordination master supplied as `host`.
+                    group_host = get_ip()
+                    if group_host in ("0.0.0.0", "::"):
+                        raise ValueError(
+                            "Stateless group rendezvous requires a reachable local "
+                            "IP; set VLLM_HOST_IP to this node's communication IP."
+                        )
                     ports, socks = _allocate_group_ports(
                         key,
-                        host,
+                        group_host,
                         coord_store,
                     )
                 else:
-                    ports = _fetch_group_ports(key, coord_store)
+                    group_host, ports = _fetch_group_ports(key, coord_store)
                     socks = []
                 device_port, cpu_port, tcp_store_port = ports
 
                 device_group = stateless_init_torch_distributed_process_group(
-                    host=host,
+                    host=group_host,
                     port=device_port,
                     rank=self.rank_in_group,
                     world_size=self.world_size,
@@ -133,7 +147,7 @@ class StatelessGroupCoordinator(GroupCoordinator):
                     listen_socket=socks[0] if socks else None,
                 )
                 cpu_group = stateless_init_torch_distributed_process_group(
-                    host=host,
+                    host=group_host,
                     port=cpu_port,
                     rank=self.rank_in_group,
                     world_size=self.world_size,
@@ -142,7 +156,7 @@ class StatelessGroupCoordinator(GroupCoordinator):
                     listen_socket=socks[1] if socks else None,
                 )
                 tcp_store_group = StatelessProcessGroup.create(
-                    host=host,
+                    host=group_host,
                     port=tcp_store_port,
                     rank=self.rank_in_group,
                     world_size=self.world_size,
