@@ -79,7 +79,9 @@ class ExternalElasticEPScaleUpHandshakeServer:
         addresses: EngineZmqAddresses,
         bootstrap: ReconfigureDistributedRequest,
         num_redundant_experts: int,
+        elastic_ep_max_dp_size: int,
     ) -> None:
+        self.elastic_ep_max_dp_size = elastic_ep_max_dp_size
         self.handshake_address = handshake_address
         self.expected_new_ranks = set(expected_new_ranks)
         self.addresses = addresses
@@ -163,6 +165,7 @@ class ExternalElasticEPScaleUpHandshakeServer:
                                 b.new_data_parallel_master_port_list
                             ),
                             "data_parallel_size": b.new_data_parallel_size,
+                            "elastic_ep_max_dp_size": self.elastic_ep_max_dp_size,
                             "_coord_store_port": b.coord_store_port,
                         }
                         init_message = msgspec.msgpack.encode(
@@ -641,6 +644,9 @@ class ExternalElasticEPScaleCoordinator:
             addresses=self._get_existing_engine_zmq_address(),
             bootstrap=bootstrap,
             num_redundant_experts=num_redundant_experts,
+            elastic_ep_max_dp_size=(
+                self.client.vllm_config.parallel_config.elastic_ep_max_dp_size
+            ),
         )
         handshake_server.start()
         return handshake_server
@@ -801,6 +807,12 @@ class ExternalElasticEPScaleCoordinator:
         parallel_config = self.client.vllm_config.parallel_config
         dp_rank = parallel_config.data_parallel_rank
         scale_up = new_data_parallel_size > cur_data_parallel_size
+        if new_data_parallel_size > parallel_config.elastic_ep_max_dp_size:
+            raise ValueError(
+                f"Cannot scale to data_parallel_size {new_data_parallel_size}; "
+                "--elastic-ep-max-dp-size is "
+                f"{parallel_config.elastic_ep_max_dp_size}."
+            )
         if not parallel_config._coord_store_port:
             raise RuntimeError(
                 "External Elastic EP requires a runtime coordination store port."
