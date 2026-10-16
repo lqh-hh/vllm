@@ -443,9 +443,7 @@ class ElasticEPScalingState:
                     args=("capture_new_rank_graphs", self._operation_id),
                 )
             else:
-                self._collective_rpc(
-                    "elastic_ep_execute", args=("warmup_new_worker",)
-                )
+                self._collective_rpc("elastic_ep_execute", args=("warmup_new_worker",))
             self._mark_ready_for_switch()
             self._wait_for_external_scale_commit()
             tensor = torch.tensor([0, 0, 0], dtype=torch.int32, device="cpu")
@@ -752,6 +750,10 @@ class ElasticEPScalingState:
             reconfig_request.new_data_parallel_master_port_list
         )
         parallel_config._coord_store_port = reconfig_request.coord_store_port
+        parallel_config._data_parallel_master_rank = (
+            reconfig_request.data_parallel_master_rank
+        )
+        parallel_config._eep_existing_dp_ranks = reconfig_request.existing_dp_ranks
 
         if self.scale_type == "scale_up":
             ft_sentinel = getattr(self.engine_core, "ft_sentinel", None)
