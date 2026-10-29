@@ -8,6 +8,7 @@ from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias
 
 import torch.distributed
+from torch.distributed.distributed_c10d import Backend, _get_default_timeout
 
 from vllm.config import ParallelConfig
 from vllm.distributed import (
@@ -582,7 +583,11 @@ class ElasticEPScalingState:
         )
 
     def _init_new_dp_group(self) -> tuple[Any, Any]:
-        return self.new_parallel_config.stateless_init_dp_group(return_store=True)
+        # Joiners may still be starting; keep the serving group's short timeout
+        # on the old group until _commit_new_dp_group activates the replacement.
+        return self.new_parallel_config.stateless_init_dp_group(
+            return_store=True, timeout=_get_default_timeout(Backend.GLOO)
+        )
 
     def _ensure_new_dp_group(self) -> bool:
         if self.new_dp_group is not None:

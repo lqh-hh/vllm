@@ -676,14 +676,23 @@ class ParallelConfig:
 
     @overload
     def stateless_init_dp_group(
-        self, return_store: Literal[False] = ...
+        self,
+        return_store: Literal[False] = ...,
+        *,
+        timeout: timedelta | None = None,
     ) -> ProcessGroup: ...
     @overload
     def stateless_init_dp_group(
-        self, return_store: Literal[True] = ...
+        self,
+        return_store: Literal[True] = ...,
+        *,
+        timeout: timedelta | None = None,
     ) -> tuple[ProcessGroup, Store]: ...
     def stateless_init_dp_group(
-        self, return_store: bool = False
+        self,
+        return_store: bool = False,
+        *,
+        timeout: timedelta | None = None,
     ) -> ProcessGroup | tuple[ProcessGroup, Store]:
         # NOTE: In high-concurrency scenarios multiple processes
         # can pick the same (currently free) port through a race
@@ -700,7 +709,8 @@ class ParallelConfig:
 
         # Under FT, startup-created groups get no configured timeout: uneven
         # rank startup would trip it. The sentinel applies it after startup.
-        timeout = self.effective_cpu_distributed_timeout
+        if timeout is None:
+            timeout = self.effective_cpu_distributed_timeout
 
         max_retries = 5
         last_exc: Exception | None = None

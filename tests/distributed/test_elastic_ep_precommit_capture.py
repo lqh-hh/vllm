@@ -1,15 +1,121 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import asyncio
+from datetime import timedelta
 from queue import Queue
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
+import msgspec
 import pytest
+import torch
+import zmq.asyncio
+from torch.distributed.distributed_c10d import Backend, _get_default_timeout
 
+from vllm.config import ParallelConfig
+from vllm.distributed import utils as distributed_utils
+from vllm.distributed.elastic_ep import elastic_state
 from vllm.distributed.elastic_ep.elastic_state import (
     ElasticEPScalingState,
     ScaleUpExistingEngineState,
 )
+from vllm.utils.network_utils import get_open_zmq_inproc_path, make_zmq_socket
+from vllm.v1.engine.core_client import DPAsyncMPClient
+
+
+@pytest.mark.asyncio
+async def test_idle_request_notifies_coordinator_after_repeated_migration():
+    with zmq.asyncio.Context() as ctx:
+        client = object.__new__(DPAsyncMPClient)
+        client.ctx = ctx
+        client.resources = SimpleNamespace(stats_update_task=None)
+        client.stats_update_address = None
+        client.engine_ranks_managed = [3]
+        client.core_engine = (3).to_bytes(2, "little")
+        client.client_index = 0
+        client.current_wave = 7
+        client.call_utility_async = AsyncMock()
+        sent = asyncio.get_running_loop().create_future()
+        sent.set_result(None)
+        client._send_input = MagicMock(return_value=sent)
+        client._ensure_output_queue_task = MagicMock()
+        client.first_req_sock_addr = get_open_zmq_inproc_path()
+        client.first_req_send_socket = make_zmq_socket(
+            ctx, client.first_req_sock_addr, zmq.PAIR, bind=True
+        )
+        try:
+            for _ in range(3):
+                with ctx.socket(zmq.XPUB) as coordinator:
+                    address = get_open_zmq_inproc_path()
+                    coordinator.bind(address)
+                    await client.reconnect_dp_coordinator("input", "output", address)
+                    assert await asyncio.wait_for(coordinator.recv(), 2) == b"\x01"
+                    client.engines_running = False
+                    await asyncio.wait_for(
+                        client.add_request_async(SimpleNamespace()), 2
+                    )
+                    notification = await asyncio.wait_for(coordinator.recv(), 2)
+                    assert msgspec.msgpack.decode(notification) == [
+                        client.core_engine,
+                        7,
+                    ]
+        finally:
+            task = client.resources.stats_update_task
+            if task is not None:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            client.first_req_send_socket.close(linger=0)
+
+
+@pytest.mark.parametrize("steady_state", [False, True])
+def test_standby_dp_init_can_wait_for_joiners_without_changing_serving_timeout(
+    monkeypatch, steady_state
+):
+    parallel = object.__new__(ParallelConfig)
+    parallel.enable_fault_tolerance = True
+    parallel.cpu_distributed_timeout_seconds = 60
+    parallel.data_parallel_master_ip = "127.0.0.1"
+    parallel.data_parallel_rank = 3
+    parallel.data_parallel_size = 4
+    parallel._data_parallel_master_rank = 1
+    parallel._pick_stateless_dp_port = lambda: (29500, None)
+    monkeypatch.setattr(distributed_utils, "steady_state_entered", lambda: steady_state)
+    init_group = MagicMock(return_value=(object(), object()))
+    monkeypatch.setattr(
+        distributed_utils, "stateless_init_torch_distributed_process_group", init_group
+    )
+    state = object.__new__(ElasticEPScalingState)
+    state.new_parallel_config = parallel
+
+    assert state._init_new_dp_group() == init_group.return_value
+    assert init_group.call_args.kwargs["timeout"] == _get_default_timeout(Backend.GLOO)
+    assert init_group.call_args.kwargs["store_master_rank"] == 1
+    assert parallel.cpu_distributed_timeout_seconds == 60
+    parallel.stateless_init_dp_group()
+    expected = timedelta(seconds=60) if steady_state else None
+    assert init_group.call_args.kwargs["timeout"] == expected
+
+
+def test_commit_restores_serving_timeout_on_replacement_dp_group(monkeypatch):
+    state = object.__new__(ElasticEPScalingState)
+    state.old_dp_group = object()
+    state.new_dp_group = SimpleNamespace(rank=lambda: 3)
+    state.new_dp_store = object()
+    state.new_parallel_config = SimpleNamespace(cpu_distributed_timeout_seconds=60)
+    engine = SimpleNamespace(engines_running=True, current_wave=7, step_counter=5)
+    state.engine_core_ref = lambda: engine
+    monkeypatch.setattr(
+        elastic_state, "stateless_destroy_torch_distributed_process_group", MagicMock()
+    )
+    monkeypatch.setattr(torch.distributed, "all_reduce", MagicMock())
+    restore_timeout = MagicMock()
+    monkeypatch.setattr(elastic_state, "set_gloo_backend_timeout", restore_timeout)
+
+    state._commit_new_dp_group()
+
+    assert engine.dp_group is state.new_dp_group
+    assert engine.dp_store is state.new_dp_store
+    restore_timeout.assert_called_once_with(state.new_dp_group, timedelta(seconds=60))
 
 
 def test_existing_engine_waits_for_precommit_capture_before_commit():
